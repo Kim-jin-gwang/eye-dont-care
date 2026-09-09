@@ -1,0 +1,62 @@
+app:
+  guest:
+    session-ttl: PT24H
+    # 게스트 세션 발급(POST /api/v1/guests/session)은 인증 없이 열려 있으므로 클라이언트당 상한을 둔다.
+    # 사람은 탭을 열 때마다 한 번 부르므로 분당 30회면 충분히 넉넉하고, 공유 IP(NAT)에서 여러 명이
+    # 동시에 들어와도 걸리지 않는다. 이미 세션이 있는 재사용 요청은 이 상한을 소모하지 않는다.
+    issue-rate-limit:
+      limit: 30
+      window: PT1M
+  matchmaking:
+    # 매칭 대기 자체에는 시간 제한이 없다. 이 값은 연결이 끊긴 참가자를 청소하는 안전망이다.
+    # WebSocket(/ws/match)이 붙어 연결 종료를 감지하게 되면 재검토한다.
+    entry-ttl: PT30M
+  waiting-room:
+    active-ttl: PT10M
+    closed-ttl: PT30S
+    max-participants: 2
+    invite-code-max-attempts: 20
+    countdown-duration: PT3S
+    websocket:
+      auth-timeout: PT5S
+      send-time-limit: PT5S
+      buffer-size-limit: 65536
+
+spring:
+  application:
+    name: backend
+  profiles:
+    default: dev
+  mvc:
+    problemdetails:
+      enabled: false
+  web:
+    error:
+      include-exception: false
+      include-message: never
+      include-stacktrace: never
+      include-binding-errors: never
+      include-path: always
+
+server:
+  port: ${SERVER_PORT:8080}
+
+jwt:
+  access-token-expiration-seconds: ${JWT_ACCESS_TOKEN_EXPIRATION_SECONDS:1800}
+  refresh-token-expiration-seconds: ${JWT_REFRESH_TOKEN_EXPIRATION_SECONDS:86400}
+
+kakao:
+  token-uri: https://kauth.kakao.com/oauth/token
+  user-info-uri: https://kapi.kakao.com/v2/user/me
+  connect-timeout: 3s
+  read-timeout: 5s
+
+vision-api:
+  # OpenAI 호환 Vision API. 키는 비밀값이라 환경변수(VISION_API_KEY)로만 주입한다.
+  base-uri: ${VISION_API_BASE_URI:https://api.openai.com/v1/chat/completions}
+  api-key: ${VISION_API_KEY:}
+  model: ${VISION_API_MODEL:gpt-4o}
+  connect-timeout: 5s
+  # Vision(gpt-4o) 채점은 이미지 크기·게이트웨이 부하에 따라 30초를 넘길 수 있어
+  # 읽기 타임아웃 초과 → 502(BAD_GATEWAY)로 이어졌다. 여유를 둬 정상 응답을 기다린다.
+  read-timeout: 60s

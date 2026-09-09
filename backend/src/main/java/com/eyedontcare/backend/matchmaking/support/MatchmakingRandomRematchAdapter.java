@@ -1,0 +1,92 @@
+package com.eyedontcare.backend.matchmaking.support;
+
+import java.util.UUID;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+import com.eyedontcare.backend.game.entity.GameName;
+import com.eyedontcare.backend.matchmaking.exception.MatchmakingErrorCode;
+import com.eyedontcare.backend.matchmaking.service.MatchNotifier;
+import com.eyedontcare.backend.matchmaking.service.MatchmakingService;
+import com.eyedontcare.backend.matchmaking.service.RandomRematchService;
+import com.eyedontcare.backend.waitingroom.service.RandomRematchRequester;
+import com.eyedontcare.backend.waitingroom.service.RandomRematchRequestResult;
+
+@Component
+public class MatchmakingRandomRematchAdapter implements RandomRematchRequester {
+
+	private static final Logger log = LoggerFactory.getLogger(MatchmakingRandomRematchAdapter.class);
+
+	private final RandomRematchService randomRematchService;
+	private final MatchNotifier matchNotifier;
+	private final MatchmakingService matchmakingService;
+
+	public MatchmakingRandomRematchAdapter(
+		RandomRematchService randomRematchService,
+		MatchNotifier matchNotifier,
+		MatchmakingService matchmakingService
+	) {
+		this.randomRematchService = randomRematchService;
+		this.matchNotifier = matchNotifier;
+		this.matchmakingService = matchmakingService;
+	}
+
+	@Override
+	public RandomRematchRequestResult requeueRemaining(
+		UUID previousRoomId,
+		GameName gameName,
+		String participantKey
+	) {
+		RandomRematchRequestResult result;
+		try {
+			result = randomRematchService.requeueRemaining(previousRoomId, gameName, participantKey);
+		} catch (RuntimeException exception) {
+			log.error(
+				"자동 재매칭 등록에 실패했습니다. previousRoomId={}, participantKey={}",
+				previousRoomId,
+				participantKey,
+				exception
+			);
+			notifyError(participantKey, MatchmakingErrorCode.REMATCH_FAILED);
+			return RandomRematchRequestResult.FAILED;
+		}
+
+		switch (result) {
+			case REQUEUED -> {
+				notifyRequeued(participantKey, gameName);
+				tryMatch(gameName);
+			}
+			case PARTICIPANT_INVALID ->
+				notifyError(participantKey, MatchmakingErrorCode.REMATCH_PARTICIPANT_INVALID);
+			case FAILED -> notifyError(participantKey, MatchmakingErrorCode.REMATCH_FAILED);
+			case ALREADY_REQUEUED -> {
+				// 동일 요청은 Redis 상태와 WebSocket 알림을 모두 반복하지 않는다.
+			}
+		}
+		return result;
+	}
+
+	private void tryMatch(GameName gameName) {
+		try {
+			matchmakingService.tryMatchAfterRequeue(gameName);
+		} catch (RuntimeException exception) {
+			log.warn("재매칭 즉시 시도에 실패했지만 등록 상태는 유지합니다. gameType={}", gameName, exception);
+		}
+	}
+
+	private void notifyRequeued(String participantKey, GameName gameName) {
+		try {
+			matchNotifier.notifyRequeued(participantKey, gameName);
+		} catch (RuntimeException exception) {
+			log.warn("재매칭 등록 알림 전송에 실패했습니다. participantKey={}", participantKey, exception);
+		}
+	}
+
+	private void notifyError(String participantKey, MatchmakingErrorCode errorCode) {
+		try {
+			matchNotifier.notifyError(participantKey, errorCode);
+		} catch (RuntimeException exception) {
+			log.warn("재매칭 오류 알림 전송에 실패했습니다. participantKey={}", participantKey, exception);
+		}
+	}
+}

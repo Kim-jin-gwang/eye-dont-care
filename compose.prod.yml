@@ -1,0 +1,91 @@
+name: eye-dont-care-prod
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+        # Vite는 빌드 시점에 값을 굽는다. 비어 있으면 프로덕션 카카오 로그인이 동작하지 않는다.
+        VITE_KAKAO_CLIENT_ID: ${VITE_KAKAO_CLIENT_ID:-}
+        VITE_KAKAO_REDIRECT_URI: ${VITE_KAKAO_REDIRECT_URI:-}
+        # 비어 있으면 SeeSo를 시도하지 않고 MediaPipe 시선 추정으로 폴백한다.
+        VITE_SEESO_LICENSE_KEY: ${VITE_SEESO_LICENSE_KEY:-}
+    image: eyedontcare-frontend:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${FRONTEND_HOST_PORT:-3000}:80"
+    depends_on:
+      - backend
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    image: eyedontcare-backend:latest
+    restart: unless-stopped
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:?POSTGRES_USER is required}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      SERVER_PORT: "8080"
+      SERVER_FORWARD_HEADERS_STRATEGY: native
+      # application-prod.yml이 기본값 없이 요구하는 값들. 누락 시 컨텍스트 로딩이 실패한다.
+      # --env-file은 보간용일 뿐이라 여기에 명시해야 컨테이너로 주입된다.
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is required}
+      KAKAO_CLIENT_ID: ${KAKAO_CLIENT_ID:?KAKAO_CLIENT_ID is required}
+      KAKAO_CLIENT_SECRET: ${KAKAO_CLIENT_SECRET:?KAKAO_CLIENT_SECRET is required}
+      KAKAO_REDIRECT_URI: ${KAKAO_REDIRECT_URI:?KAKAO_REDIRECT_URI is required}
+      APP_CORS_ALLOWED_ORIGINS: ${APP_CORS_ALLOWED_ORIGINS:?APP_CORS_ALLOWED_ORIGINS is required}
+      OPENVIDU_URL: ${OPENVIDU_URL:?OPENVIDU_URL is required}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?LIVEKIT_API_KEY is required}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?LIVEKIT_API_SECRET is required}
+      # 눈으로 그리기 AI 채점(Vision API). 키 없이도 부팅되도록 선택값(:-)으로 두고,
+      # 없으면 그림 인식만 비활성(503)된다. 실제 키는 배포 환경 시크릿으로 주입한다.
+      VISION_API_KEY: ${VISION_API_KEY:-}
+      VISION_API_BASE_URI: ${VISION_API_BASE_URI:-https://api.openai.com/v1/chat/completions}
+      VISION_API_MODEL: ${VISION_API_MODEL:-gpt-4o}
+    ports:
+      - "127.0.0.1:${BACKEND_HOST_PORT:-8000}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres-prod-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-prod-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  postgres-prod-data:
+  redis-prod-data:

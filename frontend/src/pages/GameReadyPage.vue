@@ -1,0 +1,3284 @@
+<script setup lang="ts">
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
+import { useToast } from '../composables/useToast'
+import { gameDetails, isGameDetailId } from '../mocks/game-details'
+import { useMediaSessionStore } from '../stores/mediaSession'
+import { useMediaSettingsStore } from '../stores/mediaSettings'
+import {
+  useWaitingRoomSocket,
+  type WaitingRoomSocketContext,
+} from '../composables/useWaitingRoomSocket'
+import { useMatchSocket } from '../composables/useMatchSocket'
+import { useRandomRematchLifecycle } from '../composables/useRandomRematchLifecycle'
+import { useInviteRoomLifecycle } from '../composables/useInviteRoomLifecycle'
+import { useLiveKitRoom } from '../composables/useLiveKitRoom'
+import { useEyeTracking } from '../composables/useEyeTracking'
+import { useSeeSoGaze } from '../composables/useSeeSoGaze'
+import { useCalibrationStore } from '../stores/calibration'
+import { playCalibrationSound } from '../lib/sound/calibration-sound'
+import { joinMatch, cancelMatch } from '../api/match'
+import { createInviteRoom, joinInviteRoom, leaveRoom } from '../api/waitingRoom'
+import { ApiError } from '../api/http'
+import {
+  currentAccessToken,
+  currentParticipantKey,
+  ensureIdentity,
+  resolveIdentity,
+} from '../api/identity'
+import { isPlayEntryMode, issuePlayEntry } from '../utils/soloPlayEntry'
+import { GAME_NAME_BY_ID } from '../types/waitingRoom'
+import GameMediaControls from '../components/games/GameMediaControls.vue'
+import GameStartCountdownModal from '../components/games/GameStartCountdownModal.vue'
+import type {
+  GameName,
+  WaitingRoomGameStartData,
+  WaitingRoomIdentity,
+  WaitingRoomParticipant,
+  WaitingRoomStateData,
+} from '../types/waitingRoom'
+import type {
+  CalibrationEvaluation,
+  Point,
+} from '../lib/eye-tracking/gaze-calibration'
+
+type CameraPermissionStatus =
+  'idle' | 'requesting' | 'granted' | 'denied' | 'unavailable'
+
+/**
+ * 실제 캘리브레이션 단계.
+ * - open/closed: 눈 뜬/감은 기준(EAR) 샘플링 — 모든 게임 공통
+ * - gaze: 화면 응시 좌표 보정(9점) — 좌표가 필요한 게임(그림그리기/에어하키)만 진행
+ * - done: 보정 완료
+ */
+type CalibrationStage = 'open' | 'closed' | 'gaze' | 'done'
+
+const route = useRoute()
+const router = useRouter()
+const { showToast } = useToast()
+const permissionStatus = ref<CameraPermissionStatus>('idle')
+const isCalibrated = ref(false)
+const isReady = ref(false)
+const isWebcamGuideOpen = ref(true)
+const isCalibrationOpen = ref(false)
+const isCameraErrorOpen = ref(false)
+const isGameStartDialogOpen = ref(false)
+const countdown = ref(3)
+const cameraStream = ref<globalThis.MediaStream | null>(null)
+
+// --- 실제 눈/시선 인식 (캘리브레이션) ---
+const eyeTracking = useEyeTracking()
+const calibrationStore = useCalibrationStore()
+const isSamplingEyeStep = ref(false)
+const isSamplingGaze = ref(false)
+const eyeSampleFeedback = ref<'idle' | 'success' | 'insufficient'>('idle')
+const gazeCalibrationTargetIndex = ref(0)
+const gazeCalibrationEvaluation = ref<CalibrationEvaluation | null>(null)
+const calibrationStageIndex = ref(0)
+
+/** 화면 좌표(gaze)가 실제로 필요한 게임만 9점 시선 보정을 추가로 거친다. */
+const needsGazeCalibration = computed(() =>
+  ['draw', 'air'].includes(game.value?.id ?? ''),
+)
+const calibrationStages = computed<CalibrationStage[]>(() =>
+  needsGazeCalibration.value
+    ? ['open', 'closed', 'gaze', 'done']
+    : ['open', 'closed', 'done'],
+)
+const calibrationStage = computed<CalibrationStage>(
+  () => calibrationStages.value[calibrationStageIndex.value] ?? 'done',
+)
+/** 진행률 표시용 — "done" 단계는 세지 않는다. */
+const totalCalibrationSteps = computed(() => calibrationStages.value.length - 1)
+const calibrationStepNumber = computed(() =>
+  Math.min(calibrationStageIndex.value + 1, totalCalibrationSteps.value),
+)
+const calibrationStageTitle = computed(() => {
+  switch (calibrationStage.value) {
+    case 'open':
+      return '눈 뜬 상태 기록'
+    case 'closed':
+      return '눈 감은 상태 기록'
+    case 'gaze':
+      return '시선 좌표 보정'
+    default:
+      return '캘리브레이션 완료'
+  }
+})
+const calibrationStageDescription = computed(() => {
+  switch (calibrationStage.value) {
+    case 'open':
+      return '카메라를 정면으로 보고 눈을 편하게 뜬 상태를 유지해 주세요.'
+    case 'closed':
+      return '이번엔 눈을 감은 상태를 유지해 주세요.'
+    case 'gaze':
+      // 1단계(SeeSo 자체 보정)는 버튼 없이 응시만으로 자동 진행되므로 안내가 달라야 한다.
+      return isSeeSoCalibrating.value
+        ? seeSoCalibrationHint.value ||
+            '자동 보정 중입니다. 점을 바라봐 주세요.'
+        : '화면에 표시된 점을 눈으로 바라본 뒤 버튼을 눌러주세요.'
+    default:
+      return '보정이 완료되었습니다.'
+  }
+})
+const calibrationPrimaryLabel = computed(() => {
+  if (
+    calibrationStage.value === 'open' ||
+    calibrationStage.value === 'closed'
+  ) {
+    if (isSamplingEyeStep.value) return '기록 중…'
+    if (eyeSampleFeedback.value === 'success') return '완료!'
+    return '기록 시작'
+  }
+  if (calibrationStage.value === 'gaze') {
+    // SeeSo 자체 보정(1단계)이 도는 동안에는 9점 보정으로 넘어갈 수 없다.
+    if (isSeeSoCalibrating.value) return 'SeeSo 보정 중…'
+    if (isSamplingGaze.value) return '기록 중…'
+    const isLast =
+      gazeCalibrationTargetIndex.value >=
+      eyeTracking.gazeCalibrationTargets.length - 1
+    return isLast
+      ? '보정 완료'
+      : `다음 지점 (${gazeCalibrationTargetIndex.value + 1}/${eyeTracking.gazeCalibrationTargets.length})`
+  }
+  return '완료'
+})
+const calibrationBackLabel = computed(() =>
+  calibrationStageIndex.value === 0 ? '나중에 하기' : '이전',
+)
+/** SeeSo 시선 추적. 라이선스 키가 없으면 아무 일도 하지 않고 MediaPipe로 폴백한다. */
+const seesoGaze = useSeeSoGaze()
+/** SeeSo 자체 보정(1단계, 5점) 진행 상태. */
+const isSeeSoCalibrating = ref(false)
+const seeSoCalibrationProgress = ref(0)
+/** SeeSo 보정 중 사용자에게 보여줄 안내 문구. */
+const seeSoCalibrationHint = ref('')
+/**
+ * 재시도·재시작처럼 **평소와 다른 일이 벌어지는 중**임을 알리는 문구. 값이 있으면 하단 안내가
+ * 평소의 "주황색 점을 계속 바라봐 주세요" 대신 이 문구로 바뀐다.
+ *
+ * 이게 없으면 진행률이 멈춘 채 하단 문구도 그대로라, 재시도하고 있는지 굳어버린 건지 구분할
+ * 방법이 사용자에게 전혀 없다(실제로 보고된 혼란).
+ */
+const seeSoCalibrationNotice = ref('')
+/**
+ * 1단계 보정을 기다리는 최대 시간 — **마지막 안전망**이다.
+ *
+ * 정상적으로는 여기 도달하지 않는다. 프로바이더의 워치독이 진행이 멈춘 것을 감지해 스스로
+ * 끝내기 때문이다. 시선이 안 잡히면 약 6초 만에 접고, 시선이 잡히는 동안(사용자가 잠깐 다른
+ * 곳을 본 경우)에는 다시 바라볼 시간을 넉넉히 준다. 그 회복 시간을 이 타임아웃이 잘라 버리면
+ * 정상 사용자가 실패 처리되므로, 회복 한도(약 30초)보다 넉넉하게 잡는다.
+ */
+const SEESO_CALIBRATION_TIMEOUT_MS = 45000
+
+/**
+ * SeeSo 자체 보정을 몇 번까지 다시 시도할지. SeeSo는 시선 추적의 핵심이라 한 번 실패했다고
+ * 정확도가 낮은 MediaPipe로 넘기지 않고 다시 시도한다({@link runSeeSoCalibrationWithRetry}).
+ * 너무 크게 잡으면 실패가 계속될 때 사용자가 오래 붙잡히므로 3회로 둔다(최악 약 40초).
+ */
+const SEESO_CALIBRATION_MAX_ATTEMPTS = 3
+/** SDK가 지정한 현재 보정 점(뷰포트 픽셀 좌표). */
+const seeSoCalibrationPoint = ref<{ x: number; y: number } | null>(null)
+const seeSoCalibrationPointStyle = computed(() => {
+  const point = seeSoCalibrationPoint.value
+  if (!point) return {}
+  return { left: `${point.x}px`, top: `${point.y}px` }
+})
+
+const gazeCalibrationTargetStyle = computed(() => {
+  const target =
+    eyeTracking.gazeCalibrationTargets[gazeCalibrationTargetIndex.value]
+  if (!target) return {}
+  return { left: `${target.x * 100}%`, top: `${target.y * 100}%` }
+})
+// previewVideo는 캘리브레이션 다이얼로그에서만 쓰인다. eyeTracking.videoRef를 그대로 별칭으로 써서
+// 사용자가 보는 영상과 MediaPipe가 실제로 분석하는 영상이 항상 같은 엘리먼트이도록 한다.
+const previewVideo = eyeTracking.videoRef
+const panelVideo = ref<globalThis.HTMLVideoElement | null>(null)
+const dialogRef = ref<globalThis.HTMLElement | null>(null)
+let previousBodyOverflow = ''
+let isBodyScrollLocked = false
+let countdownTimer: ReturnType<typeof globalThis.setInterval> | undefined
+let calibrationOperationGeneration = 0
+let syncedCalibrationConnection: string | null = null
+let pendingRetryJoin = false
+let allowRandomRouteExit = false
+let randomExitPromise: Promise<void> | null = null
+let allowInviteRouteExit = false
+let inviteExitPromise: Promise<void> | null = null
+
+const inviteLifecycle = useInviteRoomLifecycle()
+
+const game = computed(() => {
+  const id = String(route.params.gameId ?? '')
+  return isGameDetailId(id) ? gameDetails[id] : undefined
+})
+const mode = computed(() => String(route.query.mode ?? 'solo'))
+const roomCode = computed(() => String(route.query.room ?? ''))
+const isMultiplayer = computed(() => ['friends', 'random'].includes(mode.value))
+const isFriendRoom = computed(() => mode.value === 'friends')
+const isRandomRoom = computed(() => mode.value === 'random')
+const inviteFlowState = computed(() => inviteLifecycle.flowState.value)
+const isInviteJoined = computed(
+  () => isFriendRoom.value && inviteFlowState.value === 'JOINED',
+)
+const isHost = computed(
+  () => isInviteJoined.value && inviteLifecycle.myRoomRole.value === 'HOST',
+)
+const currentGameType = computed(() =>
+  game.value ? GAME_NAME_BY_ID[game.value.id] : null,
+)
+
+// --- 친구(invite) 대결 실시간 세션 ---
+// REST로 방을 만들거나 참가하면 실시간 세션이 켜지고, 대기방 WebSocket으로 상대 준비 상태와
+// GAME_START(미디어 접속 정보)를 주고받는다. 백엔드가 없거나 실패하면 기존 mock 준비 화면을 유지한다.
+const mediaSession = useMediaSessionStore()
+const liveRoomId = ref<string | null>(null)
+const liveRoomCode = ref<string | null>(null)
+const liveIdentity = ref<WaitingRoomIdentity | null>(null)
+/** 친구방 입장(생성/참가) 실패 메시지. 설정되면 유령 방 대신 실패 안내를 보여준다. */
+const inviteError = computed(
+  () => inviteLifecycle.failure.value?.message ?? null,
+)
+const canRetryInvite = computed(
+  () => inviteLifecycle.failure.value?.retryable === true,
+)
+const isLiveSession = computed(() => liveRoomId.value !== null)
+const myRoomRole = computed(() =>
+  isFriendRoom.value ? inviteLifecycle.myRoomRole.value : 'PLAYER',
+)
+
+const randomLifecycle = useRandomRematchLifecycle()
+const hasRetriedMatchSocket = ref(false)
+const isRetryingMatch = ref(false)
+const hasUsedMatchRetry = ref(false)
+
+const matchSocket = useMatchSocket({
+  onOpen: handleMatchSocketOpen,
+  onMatchSuccess: handleMatchSuccess,
+  onRequeued: handleMatchRequeued,
+  onError: handleMatchError,
+  onUnexpectedClose: handleUnexpectedMatchClose,
+})
+
+const waitingSocket = useWaitingRoomSocket({
+  onRoomState: handleWaitingRoomState,
+  onGameStart: handleGameStart,
+  onError: handleWaitingRoomError,
+  onUnexpectedClose: handleUnexpectedWaitingRoomClose,
+})
+
+const liveOpponent = computed<WaitingRoomParticipant | null>(() => {
+  const participants = waitingSocket.roomState.value?.participants ?? []
+  if (isRandomRoom.value) {
+    const participantKey = currentParticipantKey()
+    return (
+      participants.find(
+        (participant) => participant.participantKey !== participantKey,
+      ) ?? null
+    )
+  }
+  return inviteLifecycle.opponents.value[0] ?? null
+})
+const isOpponentReady = computed(() => liveOpponent.value?.isReady ?? false)
+// 실제 입장이 확정된 코드(liveRoomCode)만 노출한다. 참가자가 입력한 코드(roomCode)를 그대로
+// 보여주면 입장 실패 시에도 방이 생긴 것처럼 보이므로 쓰지 않는다.
+const displayRoomCode = computed(() => liveRoomCode.value ?? '')
+const canUseWaitingRoomCommands = computed(
+  () => isRandomRoom.value || isInviteJoined.value,
+)
+const showPreparationUi = computed(
+  () => !isFriendRoom.value || isInviteJoined.value,
+)
+
+const participantCount = computed(
+  () => waitingSocket.roomState.value?.participants.length ?? 2,
+)
+
+// 대기방 미디어(피어 웹캠·음성 대화): 방 참가 시 받은 토큰으로 OpenVidu에 연결해 상대 웹캠과
+// 음성을 구독하고, 내 카메라가 준비되면 내 트랙(영상+마이크)을 송출한다.
+// 내 웹캠은 아래 getUserMedia 프리뷰로 이미 보여준다.
+const readyMedia = useLiveKitRoom()
+const opponentVideoRef = readyMedia.remoteVideoRef
+const hasPeerCamera = computed(() => readyMedia.hasRemoteVideo.value)
+const isOpponentCameraOff = computed(() => readyMedia.isRemoteCameraOff.value)
+// vue-tsc가 문자열 템플릿 ref(ref="opponentVideoRef")를 '사용'으로 세지 못해 noUnusedLocals가
+// 오탐한다. 실제로는 <video ref="opponentVideoRef">에 런타임 바인딩된다.
+void opponentVideoRef
+let readyMediaStarted = false
+
+const mediaSettings = useMediaSettingsStore()
+
+async function connectReadyMedia() {
+  if (isFriendRoom.value && !isInviteJoined.value) return
+  if (readyMediaStarted || !cameraStream.value || !mediaSession.credentials) {
+    return
+  }
+  readyMediaStarted = true
+  await readyMedia.connect(mediaSession.credentials, {
+    localTrack: cameraStream.value.getVideoTracks()[0] ?? null,
+    audio: mediaSettings.micEnabled,
+  })
+  // 이전 게임에서 카메라 송출을 꺼 뒀다면 대기방에서도 이어받는다.
+  // 내 프리뷰는 캘리브레이션에 필요하므로 가리지 않는다 — 상대에게만 안 보인다.
+  if (!mediaSettings.cameraEnabled) {
+    await readyMedia.setCameraPublishEnabled(false)
+  }
+}
+
+// 상대 음성 볼륨은 연결·구독 시점과 무관하게 항상 최신 값이 적용되도록 즉시 동기화한다.
+watch(
+  () => mediaSettings.voiceVolume,
+  (volume) => readyMedia.setRemoteAudioVolume(volume),
+  { immediate: true },
+)
+watch(
+  () => mediaSettings.micEnabled,
+  async (enabled) => {
+    const applied = await readyMedia.setMicrophoneEnabled(enabled)
+    if (enabled && !applied) {
+      showToast('마이크를 켜지 못했어요. 마이크 권한을 확인해 주세요.')
+    }
+  },
+)
+watch(
+  () => mediaSettings.cameraEnabled,
+  (enabled) => {
+    void readyMedia.setCameraPublishEnabled(enabled)
+  },
+)
+
+const roomTitle = computed(() => {
+  if (isRandomRoom.value) return '랜덤 매칭 준비방'
+  if (isFriendRoom.value) return '친구와 대결 준비방'
+  if (mode.value === 'ai') return 'AI 대결 준비방'
+  return '혼자하기 준비방'
+})
+const roomDescription = computed(() => {
+  if (isRandomRoom.value)
+    return '상대를 찾았습니다. 서로 준비를 완료하면 게임이 시작됩니다.'
+  if (isFriendRoom.value) {
+    if (!isInviteJoined.value) return '초대방 입장 상태를 확인하고 있어요.'
+    return isHost.value
+      ? '참가자의 준비가 완료되면 게임을 시작할 수 있어요.'
+      : '준비를 완료한 뒤 방장이 게임을 시작할 때까지 기다려 주세요.'
+  }
+  return '게임 시작 전 카메라와 시선 인식 준비 상태를 확인해 주세요.'
+})
+// 권한 승인 + 트랙이 실제 라이브일 때만 연결로 본다. 브라우저/OS에서 캠을 끄면(track ended)
+// cameraActive가 false로 떨어져 화면이 다시 "카메라 연결하기" 상태로 돌아간다.
+const isCameraConnected = computed(
+  () => permissionStatus.value === 'granted' && eyeTracking.cameraActive.value,
+)
+const canStartCalibration = computed(() => isCameraConnected.value)
+const canMarkReady = computed(
+  () =>
+    isCalibrated.value &&
+    !isHost.value &&
+    (!isFriendRoom.value || isInviteJoined.value),
+)
+const ownPreparationComplete = computed(() =>
+  isHost.value ? isCalibrated.value : isReady.value,
+)
+const areAllPlayersReady = computed(() => {
+  if (!isMultiplayer.value) return ownPreparationComplete.value
+  return ownPreparationComplete.value && isOpponentReady.value
+})
+const areAllParticipantsCalibrated = computed(
+  () =>
+    waitingSocket.roomState.value?.participants.every(
+      (participant) => participant.calibrationStatus === 'COMPLETED',
+    ) ?? false,
+)
+const canStartGame = computed(
+  () =>
+    isHost.value &&
+    waitingSocket.roomState.value?.roomStatus === 'WAITING' &&
+    participantCount.value === 2 &&
+    areAllPlayersReady.value &&
+    areAllParticipantsCalibrated.value &&
+    !isGameStartDialogOpen.value,
+)
+const opponentName = computed(() =>
+  isRandomRoom.value ? '매칭된 상대' : isHost.value ? '참가자' : '방장',
+)
+const randomFlowState = computed(() => randomLifecycle.flowState.value)
+const isRandomStatusVisible = computed(
+  () =>
+    isRandomRoom.value &&
+    ['REMATCHING', 'CONNECTING_NEW_ROOM', 'ERROR'].includes(
+      randomFlowState.value,
+    ),
+)
+const canRetryRandomMatch = computed(
+  () =>
+    randomFlowState.value === 'ERROR' &&
+    randomLifecycle.matchmakingPending.value &&
+    !isRetryingMatch.value &&
+    !hasUsedMatchRetry.value,
+)
+const randomStatusTitle = computed(() => {
+  if (randomFlowState.value === 'CONNECTING_NEW_ROOM')
+    return '새로운 상대를 찾았어요.'
+  if (randomFlowState.value === 'ERROR') return '재매칭을 계속할 수 없어요.'
+  return '상대방이 대기방을 나갔어요.'
+})
+const randomStatusMessage = computed(() => {
+  if (randomFlowState.value === 'CONNECTING_NEW_ROOM')
+    return '새 대기방에 연결하고 있어요.'
+  if (randomFlowState.value === 'ERROR')
+    return (
+      randomLifecycle.errorMessage.value ??
+      '연결 상태를 확인한 뒤 다시 시도해 주세요.'
+    )
+  return '새로운 상대를 찾고 있어요.'
+})
+const actionLabel = computed(() => {
+  if (!isCameraConnected.value) return '카메라 연결하기'
+  if (!isCalibrated.value) return '캘리브레이션 시작'
+  if (!isHost.value && !isReady.value) return '준비 완료'
+  if (isHost.value) return '게임 시작'
+  return ''
+})
+const actionDisabled = computed(() => {
+  if (isFriendRoom.value && !isInviteJoined.value) return true
+  if (isRandomStatusVisible.value) return true
+  if (permissionStatus.value === 'requesting') return true
+  if (!isCameraConnected.value) return false
+  if (!isCalibrated.value) return !canStartCalibration.value
+  if (isHost.value) return !canStartGame.value
+  return !canMarkReady.value || isReady.value
+})
+function stopCameraStream() {
+  // cameraStream은 eyeTracking.stream과 같은 MediaStream을 가리키므로, 트랙만 따로 멈추지 않고
+  // eyeTracking.stop()으로 감지 루프까지 함께 정리한다(안 그러면 requestAnimationFrame 루프가
+  // 끊긴 스트림을 계속 붙잡고 있게 된다).
+  // SeeSo도 자체 카메라를 열므로 반드시 같이 멈추고, 꺼 뒀던 MediaPipe 추론은 되돌린다.
+  eyeTracking.setExternalGazeSource(null)
+  eyeTracking.setDetectionEnabled(true)
+  seesoGaze.stop()
+  eyeTracking.stop()
+  cameraStream.value = null
+}
+
+function clearGameStartCountdown() {
+  if (!countdownTimer) return
+  globalThis.clearInterval(countdownTimer)
+  countdownTimer = undefined
+}
+
+function navigateToPlay(): void {
+  if (!game.value) return
+  if (
+    isPlayEntryMode(mode.value) &&
+    !issuePlayEntry(game.value.id, mode.value)
+  ) {
+    showToast('게임을 시작할 수 없어요. 잠시 후 다시 시도해 주세요.')
+    return
+  }
+
+  void router.push({
+    name: 'game-play',
+    params: { gameId: game.value.id },
+    query: route.query,
+  })
+}
+
+function openGameStartDialog() {
+  clearGameStartCountdown()
+  // 리듬 게임은 게임 화면 안에서 자체 3·2·1 카운트다운을 하므로, 준비방에서는 카운트다운 없이 바로 이동한다.
+  if (game.value?.id === 'rhythm') {
+    navigateToPlay()
+    return
+  }
+  countdown.value = 3
+  isGameStartDialogOpen.value = true
+
+  countdownTimer = globalThis.setInterval(() => {
+    if (countdown.value === 1) {
+      clearGameStartCountdown()
+      navigateToPlay()
+      return
+    }
+    countdown.value -= 1
+  }, 1000)
+}
+
+// 실시간 세션(초대/랜덤): 서버가 방을 COUNTDOWN으로 바꾸면 3-2-1을 그린다.
+// 서버 절대 종료시각으로 남은 초를 계산하면 네트워크 지연·클라 시계 오차로 한쪽이 1·1·1로
+// 보이므로, 표시는 수신 시점부터 로컬로 3→2→1을 센다(서버 countdown은 3초). 실제 화면 전환은
+// 서버의 GAME_START 수신 시에만 일어난다(handleGameStart)므로 표시가 조금 어긋나도 무방하다.
+function openServerCountdown(endsAtIso: string) {
+  void endsAtIso
+  clearGameStartCountdown()
+  countdown.value = 3
+  isGameStartDialogOpen.value = true
+  countdownTimer = globalThis.setInterval(() => {
+    if (countdown.value <= 1) {
+      clearGameStartCountdown()
+      return
+    }
+    countdown.value -= 1
+  }, 1000)
+}
+
+function closeGameStartDialog() {
+  clearGameStartCountdown()
+  isGameStartDialogOpen.value = false
+}
+
+function isCurrentRandomWaitingContext(
+  context: WaitingRoomSocketContext,
+): boolean {
+  return (
+    context.roomId === randomLifecycle.activeRoomId.value &&
+    context.generation === waitingSocket.connectionGeneration.value
+  )
+}
+
+function handleWaitingRoomState(
+  state: WaitingRoomStateData,
+  context: WaitingRoomSocketContext,
+): void {
+  if (isFriendRoom.value) {
+    const transition = inviteLifecycle.handleRoomState(
+      state,
+      currentParticipantKey(),
+      context,
+    )
+    if (transition === 'IGNORED') return
+    if (transition === 'FAILED') {
+      clearInviteRoomBoundState()
+      waitingSocket.close()
+      return
+    }
+    if (transition === 'CLOSED') {
+      handleCurrentInviteRoomClosed()
+      return
+    }
+
+    liveRoomId.value = state.roomId
+    liveRoomCode.value = state.roomCode
+    synchronizeOwnRoomState(state, context)
+    if (state.roomStatus === 'COUNTDOWN') {
+      if (state.countdownEndsAt) openServerCountdown(state.countdownEndsAt)
+    } else if (state.roomStatus === 'WAITING') {
+      closeGameStartDialog()
+    }
+    return
+  }
+
+  if (!isRandomRoom.value || !isCurrentRandomWaitingContext(context)) return
+
+  const transition = randomLifecycle.handleRoomState(state)
+  if (transition === 'IGNORED') return
+  if (transition === 'REMATCHING') {
+    handleCurrentRandomRoomClosed()
+    return
+  }
+
+  liveRoomId.value = state.roomId
+  hasUsedMatchRetry.value = false
+  synchronizeOwnRoomState(state, context)
+
+  if (transition === 'COUNTDOWN' && state.countdownEndsAt) {
+    openServerCountdown(state.countdownEndsAt)
+  } else if (transition === 'WAITING_ROOM') {
+    closeGameStartDialog()
+  }
+}
+
+function synchronizeOwnRoomState(
+  state: WaitingRoomStateData,
+  context: WaitingRoomSocketContext,
+): void {
+  const participantKey = currentParticipantKey()
+  const ownParticipant = state.participants.find(
+    (participant) => participant.participantKey === participantKey,
+  )
+  if (!participantKey || !ownParticipant) {
+    if (isRandomRoom.value)
+      randomLifecycle.fail('대기방에서 내 참가자 정보를 확인하지 못했어요.')
+    waitingSocket.close()
+    return
+  }
+
+  isReady.value = ownParticipant.isReady
+  if (!isCalibrated.value) return
+
+  const connectionKey = `${context.roomId}:${context.generation}`
+  if (
+    syncedCalibrationConnection === connectionKey ||
+    ownParticipant.calibrationStatus === 'COMPLETED'
+  ) {
+    return
+  }
+
+  syncedCalibrationConnection = connectionKey
+  if (ownParticipant.calibrationStatus === 'PENDING') {
+    waitingSocket.sendCalibrationStatus('IN_PROGRESS')
+    waitingSocket.sendCalibrationStatus('COMPLETED')
+  } else if (ownParticipant.calibrationStatus === 'IN_PROGRESS') {
+    waitingSocket.sendCalibrationStatus('COMPLETED')
+  }
+}
+
+function handleCurrentInviteRoomClosed(): void {
+  clearInviteRoomBoundState()
+  waitingSocket.invalidateCurrentConnectionEvents()
+}
+
+function clearInviteRoomBoundState(): void {
+  calibrationOperationGeneration += 1
+  syncedCalibrationConnection = null
+  isSamplingEyeStep.value = false
+  isSamplingGaze.value = false
+  eyeSampleFeedback.value = 'idle'
+  gazeCalibrationTargetIndex.value = 0
+  gazeCalibrationEvaluation.value = null
+  isCalibrationOpen.value = false
+  isCameraErrorOpen.value = false
+  isWebcamGuideOpen.value = false
+  permissionStatus.value = 'idle'
+  isCalibrated.value = false
+  calibrationStageIndex.value = 0
+  isReady.value = false
+  liveRoomId.value = null
+  liveRoomCode.value = null
+  liveIdentity.value = null
+  clearGameStartCountdown()
+  isGameStartDialogOpen.value = false
+  stopCameraStream()
+  readyMediaStarted = false
+  void readyMedia.disconnect()
+  mediaSession.clear()
+}
+
+function handleCurrentRandomRoomClosed(): void {
+  clearRandomRoomBoundState()
+  waitingSocket.invalidateCurrentConnectionEvents()
+  hasUsedMatchRetry.value = false
+}
+
+function clearRandomRoomBoundState(): void {
+  calibrationOperationGeneration += 1
+  syncedCalibrationConnection = null
+  isSamplingEyeStep.value = false
+  isSamplingGaze.value = false
+  eyeSampleFeedback.value = 'idle'
+  gazeCalibrationTargetIndex.value = 0
+  gazeCalibrationEvaluation.value = null
+  isCalibrationOpen.value = false
+  if (!isCalibrated.value) calibrationStageIndex.value = 0
+  isReady.value = false
+  liveRoomId.value = null
+  clearGameStartCountdown()
+  isGameStartDialogOpen.value = false
+  readyMediaStarted = false
+  void readyMedia.disconnect()
+  mediaSession.clear()
+}
+
+function handleMatchRequeued(gameType: GameName): void {
+  if (!isRandomRoom.value) return
+  randomLifecycle.handleRequeued(gameType)
+}
+
+function handleMatchError(_code: string, message: string): void {
+  if (!isRandomRoom.value || randomLifecycle.isLeaving.value) return
+  pendingRetryJoin = false
+  isRetryingMatch.value = false
+  randomLifecycle.fail(message)
+  showToast(message)
+}
+
+function handleUnexpectedMatchClose(): void {
+  if (!isRandomRoom.value || randomLifecycle.isLeaving.value) return
+
+  if (isRetryingMatch.value) {
+    pendingRetryJoin = false
+    isRetryingMatch.value = false
+    randomLifecycle.fail('매칭 서버 연결이 끊어졌어요. 다시 시도해주세요.')
+    return
+  }
+
+  const flowState = randomLifecycle.flowState.value
+  if (flowState === 'REMATCHING') {
+    randomLifecycle.fail(
+      '재매칭 연결이 끊어졌어요. 다시 찾기를 눌러 재시도해 주세요.',
+    )
+    return
+  }
+
+  if (
+    ['WAITING_ROOM', 'COUNTDOWN', 'CONNECTING_NEW_ROOM'].includes(flowState) &&
+    !hasRetriedMatchSocket.value
+  ) {
+    const identity = resolveIdentity()
+    if (identity) {
+      hasRetriedMatchSocket.value = true
+      try {
+        if (matchSocket.connect(identity)) return
+      } catch {
+        // 아래 공통 오류 상태로 전환한다.
+      }
+    }
+  }
+
+  randomLifecycle.fail('매칭 서버와의 연결이 끊어졌어요.')
+}
+
+function handleMatchSocketOpen(): void {
+  if (pendingRetryJoin) void submitRandomMatchRetry()
+}
+
+function handleMatchSuccess(roomId: string, eventGameType: GameName): void {
+  if (!isRandomRoom.value) return
+  if (randomLifecycle.isLeaving.value) {
+    if (eventGameType === currentGameType.value)
+      void leaveNewRoomDuringExit(roomId)
+    return
+  }
+
+  const roomSwitch = randomLifecycle.handleMatchSuccess(roomId, eventGameType)
+  if (roomSwitch)
+    void switchRandomRoom(roomSwitch.roomId, roomSwitch.generation)
+}
+
+async function switchRandomRoom(
+  roomId: string,
+  generation: number,
+): Promise<void> {
+  clearRandomRoomBoundState()
+  waitingSocket.close()
+  hasRetriedMatchSocket.value = false
+  liveRoomId.value = roomId
+  const identity = resolveIdentity()
+  if (!identity) {
+    randomLifecycle.fail('대기방 연결에 필요한 사용자 정보를 찾지 못했어요.')
+    return
+  }
+  liveIdentity.value = identity
+
+  try {
+    await router.replace({
+      name: 'game-ready',
+      params: { gameId: game.value?.id },
+      query: { ...route.query, roomId },
+    })
+    if (!randomLifecycle.isCurrentGeneration(generation)) return
+    waitingSocket.connect(roomId, identity)
+  } catch {
+    if (randomLifecycle.isCurrentGeneration(generation))
+      randomLifecycle.fail('새 대기방에 연결하지 못했어요.')
+  }
+}
+
+function handleWaitingRoomError(
+  code: string,
+  message: string,
+  context: WaitingRoomSocketContext,
+): void {
+  if (isFriendRoom.value) {
+    if (!inviteLifecycle.isCurrentConnection(context)) return
+    if (inviteFlowState.value === 'JOINED') {
+      showToast(message)
+      return
+    }
+    if (!inviteLifecycle.failEntryConnection(context, code, message)) return
+    showToast(inviteLifecycle.failure.value?.message ?? message)
+    clearInviteRoomBoundState()
+    waitingSocket.close()
+    return
+  }
+
+  showToast(message)
+  if (!isRandomRoom.value || !isCurrentRandomWaitingContext(context)) return
+  clearGameStartCountdown()
+  isGameStartDialogOpen.value = false
+  randomLifecycle.fail(message)
+  waitingSocket.close()
+}
+
+function handleUnexpectedWaitingRoomClose(
+  context: WaitingRoomSocketContext,
+): void {
+  if (isFriendRoom.value) {
+    if (
+      ['LEAVING', 'CLOSED'].includes(inviteFlowState.value) ||
+      !inviteLifecycle.failConnection(
+        context,
+        'UNKNOWN',
+        '대기방 연결이 예기치 않게 종료됐어요.',
+      )
+    ) {
+      return
+    }
+    clearInviteRoomBoundState()
+    waitingSocket.close()
+    return
+  }
+
+  if (
+    !isRandomRoom.value ||
+    context.roomId !== randomLifecycle.activeRoomId.value ||
+    context.generation !== waitingSocket.connectionGeneration.value ||
+    randomLifecycle.isLeaving.value ||
+    randomLifecycle.flowState.value === 'REMATCHING'
+  ) {
+    return
+  }
+
+  clearGameStartCountdown()
+  isGameStartDialogOpen.value = false
+  randomLifecycle.fail('대기방 연결이 예기치 않게 종료됐어요.')
+  waitingSocket.close()
+}
+
+function handleRetryRandomMatch(): void {
+  if (!canRetryRandomMatch.value) return
+
+  const identity = resolveIdentity()
+  if (!identity) {
+    randomLifecycle.fail('재매칭에 필요한 사용자 정보를 찾지 못했어요.')
+    return
+  }
+
+  hasUsedMatchRetry.value = true
+  isRetryingMatch.value = true
+  pendingRetryJoin = true
+  if (matchSocket.isConnected.value) {
+    void submitRandomMatchRetry()
+    return
+  }
+
+  try {
+    const started = matchSocket.connect(identity)
+    if (!started && matchSocket.isConnected.value) void submitRandomMatchRetry()
+  } catch {
+    pendingRetryJoin = false
+    isRetryingMatch.value = false
+    randomLifecycle.fail('매칭 서버에 다시 연결하지 못했어요.')
+  }
+}
+
+async function submitRandomMatchRetry(): Promise<void> {
+  if (!pendingRetryJoin) return
+  pendingRetryJoin = false
+  const gameType = currentGameType.value
+  if (!gameType) {
+    isRetryingMatch.value = false
+    randomLifecycle.fail('게임 정보를 확인하지 못했어요.')
+    return
+  }
+
+  try {
+    const result = await joinMatch(gameType, currentAccessToken())
+    if (randomLifecycle.isLeaving.value) return
+    randomLifecycle.markRetryQueued()
+    if (result.waitingRoomId)
+      handleMatchSuccess(result.waitingRoomId, result.gameType)
+  } catch (error) {
+    randomLifecycle.fail(
+      error instanceof ApiError ? error.message : '재매칭 요청에 실패했어요.',
+    )
+  } finally {
+    isRetryingMatch.value = false
+  }
+}
+
+async function leaveNewRoomDuringExit(roomId: string): Promise<void> {
+  try {
+    await leaveRoom(roomId, currentAccessToken())
+  } catch {
+    // 사용자 이탈은 계속 진행하고 WebSocket/서버 TTL 정리에 맡긴다.
+  }
+}
+
+async function cleanupRandomFlowForExit(): Promise<void> {
+  if (randomExitPromise) return randomExitPromise
+
+  const shouldCancelMatch = randomLifecycle.matchmakingPending.value
+  const roomId = randomLifecycle.activeRoomId.value
+  randomLifecycle.beginLeaving()
+  pendingRetryJoin = false
+  isRetryingMatch.value = false
+
+  randomExitPromise = (async () => {
+    try {
+      if (shouldCancelMatch) await cancelMatch(currentAccessToken())
+      else if (roomId) await leaveRoom(roomId, currentAccessToken())
+    } catch (error) {
+      showToast(
+        error instanceof ApiError
+          ? error.message
+          : '대기방 정리에 실패했지만 화면 이동은 계속할게요.',
+      )
+    } finally {
+      waitingSocket.close()
+      matchSocket.close()
+      stopCameraStream()
+      clearGameStartCountdown()
+      isGameStartDialogOpen.value = false
+      readyMediaStarted = false
+      await readyMedia.disconnect()
+      mediaSession.clear()
+    }
+  })()
+  return randomExitPromise
+}
+
+async function bestEffortLeaveInvite(roomId: string): Promise<void> {
+  try {
+    await leaveRoom(roomId, currentAccessToken())
+  } catch {
+    // stale 응답이나 화면 이탈 정리는 사용자의 이동을 막지 않고 서버 TTL 정리에 맡긴다.
+  }
+}
+
+async function cleanupInviteFlowForExit(): Promise<void> {
+  if (inviteExitPromise) return inviteExitPromise
+
+  const flowState = inviteFlowState.value
+  const roomId = inviteLifecycle.activeRoomId.value ?? liveRoomId.value
+  const shouldLeave = ['JOINED', 'CONNECTING'].includes(flowState) && !!roomId
+  inviteLifecycle.beginLeaving()
+
+  inviteExitPromise = (async () => {
+    try {
+      if (shouldLeave && roomId) await leaveRoom(roomId, currentAccessToken())
+    } catch (error) {
+      showToast(
+        error instanceof ApiError
+          ? error.message
+          : '대기방 정리에 실패했지만 화면 이동은 계속할게요.',
+      )
+    } finally {
+      waitingSocket.close()
+      clearInviteRoomBoundState()
+    }
+  })()
+  return inviteExitPromise
+}
+
+async function handleLeaveRoom(): Promise<void> {
+  if (isRandomRoom.value) {
+    await cleanupRandomFlowForExit()
+    allowRandomRouteExit = true
+  } else if (isFriendRoom.value) {
+    await cleanupInviteFlowForExit()
+    allowInviteRouteExit = true
+  } else {
+    stopCameraStream()
+  }
+  await router.push({
+    name: 'game-detail',
+    params: { gameId: game.value?.id },
+  })
+}
+
+async function handleRequestCamera() {
+  if (isFriendRoom.value && !isInviteJoined.value) return
+  permissionStatus.value = 'requesting'
+
+  // 세션은 살아있고 카메라 트랙만 끊긴 경우(브라우저/OS에서 캠을 껐다 켜기): start()의 재사용
+  // 가드가 죽은 상태를 그대로 반환하므로 강제로 재획득한다. 보정은 유지한 채 프리뷰만 복구한다.
+  if (eyeTracking.isActive.value && !eyeTracking.cameraActive.value) {
+    const reacquired = await eyeTracking.restartCamera()
+    if (!reacquired) {
+      permissionStatus.value = 'unavailable'
+      isCameraErrorOpen.value = true
+      return
+    }
+    cameraStream.value = eyeTracking.stream.value
+    permissionStatus.value = 'granted'
+    isWebcamGuideOpen.value = false
+    return
+  }
+
+  // eyeTracking.start()가 카메라 권한 요청과 MediaPipe Face Landmarker 로드(CDN, 수 초 소요)를
+  // 동시에 진행한다. 모델 로드가 카메라 승인보다 먼저 끝나는 경우가 많아 체감 대기시간이 줄어든다.
+  const started = await eyeTracking.start()
+  if (!started) {
+    const reason = eyeTracking.modelError.value
+    permissionStatus.value =
+      reason === 'NotAllowedError' ? 'denied' : 'unavailable'
+    isCameraErrorOpen.value = true
+    return
+  }
+
+  cameraStream.value = eyeTracking.stream.value
+  permissionStatus.value = 'granted'
+  isWebcamGuideOpen.value = false
+  isCalibrationOpen.value = true
+  calibrationStageIndex.value = 0
+  eyeSampleFeedback.value = 'idle'
+  // 백엔드 캘리브레이션 상태는 PENDING → IN_PROGRESS → COMPLETED 순서를 요구한다.
+  // 캘리브레이션이 시작되는 이 시점에 IN_PROGRESS를 먼저 알려야 이후 COMPLETED가 수락된다.
+  notifyCalibrationStarted()
+}
+
+function handlePrimaryAction() {
+  if (isFriendRoom.value && !isInviteJoined.value) return
+  if (!isCameraConnected.value) {
+    isWebcamGuideOpen.value = true
+    return
+  }
+  if (!isCalibrated.value) {
+    isCalibrationOpen.value = true
+    return
+  }
+  if (isHost.value) {
+    if (!canStartGame.value) return
+    if (isLiveSession.value && canUseWaitingRoomCommands.value)
+      waitingSocket.sendStartGame()
+    else openGameStartDialog()
+    return
+  }
+  if (canMarkReady.value && !isReady.value) {
+    markPlayerReady()
+  }
+}
+
+function markPlayerReady(): void {
+  if (!canMarkReady.value || isReady.value) return
+  isReady.value = true
+  if (isLiveSession.value && canUseWaitingRoomCommands.value) {
+    waitingSocket.sendReady(true)
+    showToast('내 준비 상태를 완료로 표시했어요.')
+  } else if (!isMultiplayer.value) openGameStartDialog()
+  else showToast('내 준비 상태를 완료로 표시했어요.')
+}
+
+function notifyCalibrationStarted(): void {
+  if (isLiveSession.value && canUseWaitingRoomCommands.value)
+    waitingSocket.sendCalibrationStatus('IN_PROGRESS')
+}
+
+/**
+ * 캘리브레이션 다이얼로그의 "다음" 버튼 하나로 현재 단계에 맞는 실제 동작을 실행한다.
+ * - open/closed 단계: 1.2초간 눈 상태를 샘플링해 개인별 눈 뜬/감은 기준을 기록
+ * - gaze 단계: 지금 바라보고 있는 지점을 현재 캘리브레이션 타깃과 짝지어 기록
+ */
+function handleCalibrationNext() {
+  if (isFriendRoom.value && !isInviteJoined.value) return
+  if (
+    calibrationStage.value === 'open' ||
+    calibrationStage.value === 'closed'
+  ) {
+    void runEyeSampleStep(calibrationStage.value)
+    return
+  }
+  if (calibrationStage.value === 'gaze') {
+    void recordGazeCalibrationPoint()
+  }
+}
+
+async function runEyeSampleStep(kind: 'open' | 'closed') {
+  const operationGeneration = calibrationOperationGeneration
+  isSamplingEyeStep.value = true
+  eyeSampleFeedback.value = 'idle'
+  const result = await eyeTracking.recordEyeSample(kind)
+  if (operationGeneration !== calibrationOperationGeneration) return
+  isSamplingEyeStep.value = false
+
+  if (!result.success) {
+    eyeSampleFeedback.value = 'insufficient'
+    playCalibrationSound('reject')
+    showToast(eyeSampleFailureMessage(result.reason, kind))
+    return
+  }
+
+  eyeSampleFeedback.value = 'success'
+  playCalibrationSound('step')
+  // 성공 표시를 잠깐 보여준 뒤 다음 단계로 넘어간다.
+  globalThis.setTimeout(() => {
+    if (operationGeneration === calibrationOperationGeneration)
+      advanceCalibrationStage()
+  }, 500)
+}
+
+/**
+ * 눈 상태 기록 실패 안내. 요청한 단계(open/closed)와 실제 상태가 반대이면 어떻게
+ * 다시 시도해야 하는지 구체적으로 알려준다.
+ */
+function eyeSampleFailureMessage(
+  reason: 'no_face' | 'eyes_open' | 'eyes_closed' | undefined,
+  kind: 'open' | 'closed',
+): string {
+  if (reason === 'eyes_closed') {
+    return '이 단계는 눈을 뜬 상태를 기록해요. 눈을 크게 뜨고 다시 눌러주세요.'
+  }
+  if (reason === 'eyes_open') {
+    return '이 단계는 눈을 감은 상태를 기록해요. 눈을 꼭 감고 다시 눌러주세요.'
+  }
+  const targetLabel = kind === 'open' ? '눈을 뜬' : '눈을 감은'
+  return `${targetLabel} 상태를 기록하지 못했어요. 카메라를 정면으로 보고 다시 시도해 주세요.`
+}
+
+async function recordGazeCalibrationPoint() {
+  if (isSamplingGaze.value) return
+  // SeeSo 자체 보정(1단계)이 진행 중이면 9점 표본을 받지 않는다 — 아직 SDK 내부 모델이 확정되지
+  // 않아 이때 모은 표본은 신뢰할 수 없다.
+  if (isSeeSoCalibrating.value) return
+  const operationGeneration = calibrationOperationGeneration
+  const target: Point | undefined =
+    eyeTracking.gazeCalibrationTargets[gazeCalibrationTargetIndex.value]
+  if (!target) return
+
+  // 눈을 감았거나 깜빡이는 순간엔 시선 좌표가 부정확하므로 기록·다음 지점 이동을 막는다.
+  // 두 눈을 모두 뜨고 점을 바라본 상태에서만 샘플을 기록한다.
+  if (
+    !eyeTracking.faceDetected.value ||
+    eyeTracking.combinedState.value !== 'BOTH_OPEN'
+  ) {
+    playCalibrationSound('reject')
+    showToast('눈을 뜨고 점을 바라본 상태에서 눌러주세요.')
+    return
+  }
+
+  // 한 프레임이 아니라 잠깐(≈0.5초) 여러 프레임을 모아 평균낸다 — 클릭 수는 그대로,
+  // 점당 표본 품질만 높여 보정 정확도를 올린다.
+  isSamplingGaze.value = true
+  const captured = await eyeTracking.captureGazeCalibrationSample(target)
+  if (operationGeneration !== calibrationOperationGeneration) return
+  isSamplingGaze.value = false
+  if (!captured) {
+    playCalibrationSound('reject')
+    showToast('시선이 감지되지 않았어요. 점을 계속 바라봐 주세요.')
+    return
+  }
+
+  if (
+    gazeCalibrationTargetIndex.value <
+    eyeTracking.gazeCalibrationTargets.length - 1
+  ) {
+    playCalibrationSound('step')
+    gazeCalibrationTargetIndex.value += 1
+    return
+  }
+
+  const result = eyeTracking.finishGazeCalibration()
+  if (!result) {
+    playCalibrationSound('reject')
+    showToast('시선 보정에 실패했어요. 처음부터 다시 시도해 주세요.')
+    gazeCalibrationTargetIndex.value = 0
+    eyeTracking.beginGazeCalibration()
+    return
+  }
+
+  gazeCalibrationEvaluation.value = result.evaluation
+  calibrationStore.saveGazeProfile(result.profile)
+  // 보정 품질이 낮으면(타깃을 제대로 안 본 경우 등) 막지 않고 재보정을 권한다.
+  warnIfGazeCalibrationPoor(result.profile.pairs)
+  advanceCalibrationStage()
+}
+
+/**
+ * 타깃을 실제로 따라봤는지 판정한다. 제대로 응시했다면 각 지점의 원시 시선이 타깃 방향과 함께
+ * 움직여 상관계수(절대값)가 높다. 딴 데를 보거나 한 곳만 응시하면 원시 시선이 거의 고정돼
+ * 상관계수가 낮다. (보정 후 훈련오차는 6계수 다항식이 9점을 과적합해 항상 낮게 나오므로 쓰지 않는다.)
+ * 낮으면 막지 않고 재보정을 권한다 — UX를 해치지 않는다.
+ */
+function warnIfGazeCalibrationPoor(
+  pairs: { raw: Point; target: Point }[],
+): void {
+  if (pairs.length < 6) return
+  const corrX = absCorrelation(
+    pairs.map((p) => p.raw.x),
+    pairs.map((p) => p.target.x),
+  )
+  const corrY = absCorrelation(
+    pairs.map((p) => p.raw.y),
+    pairs.map((p) => p.target.y),
+  )
+  if (corrX < 0.5 || corrY < 0.5) {
+    showToast(
+      '시선이 타깃을 잘 따라오지 않았어요. 정확도를 위해 다시 보정하는 걸 권해요.',
+    )
+  }
+}
+
+/** 두 수열의 피어슨 상관계수 절대값(0~1). 방향(부호)은 무시하고 함께 움직였는지만 본다. */
+function absCorrelation(a: number[], b: number[]): number {
+  const n = a.length
+  if (n === 0) return 0
+  const meanA = a.reduce((s, v) => s + v, 0) / n
+  const meanB = b.reduce((s, v) => s + v, 0) / n
+  let num = 0
+  let devA = 0
+  let devB = 0
+  for (let i = 0; i < n; i += 1) {
+    const da = a[i] - meanA
+    const db = b[i] - meanB
+    num += da * db
+    devA += da * da
+    devB += db * db
+  }
+  const den = Math.sqrt(devA * devB)
+  return den === 0 ? 0 : Math.abs(num / den)
+}
+
+/**
+ * 시선 보정 단계에서 SeeSo를 켜고, 이후 9점 보정이 SeeSo 좌표를 학습하도록 연결한다.
+ *
+ * 2단계 구조다:
+ *  1단계 — SeeSo 자체 보정(5점). SDK 내부 모델을 사용자에게 맞춘다.
+ *  2단계 — 이어지는 9점 보정. SeeSo 출력에 남은 개인 오차를 한 번 더 교정한다.
+ *
+ * SeeSo를 쓸 수 없으면(키 없음/도메인 미등록 등) 아무것도 바꾸지 않는다 — 기존 MediaPipe 시선으로
+ * 9점 보정이 진행되며 앱은 정상 동작한다.
+ */
+async function startSeeSoForCalibration(): Promise<void> {
+  if (!seesoGaze.isConfigured) return
+
+  // ⚠️ 이 플래그를 **초기화를 기다리기 전에** 세워야 한다. SDK 초기화에 몇 초가 걸리는데, 그
+  // 동안 플래그가 꺼져 있으면 2단계(9점) 점과 버튼이 먼저 떠서 1단계와 겹쳐 보인다 — 사용자가
+  // 어느 쪽을 따라야 하는지 알 수 없게 된다.
+  isSeeSoCalibrating.value = true
+  seeSoCalibrationProgress.value = 0
+  seeSoCalibrationPoint.value = null
+  seeSoCalibrationHint.value = '시선 추적 엔진을 준비하는 중이에요…'
+
+  try {
+    const started = await seesoGaze.start()
+    if (!started) return
+    // 준비되는 동안 사용자가 보정 화면을 벗어났으면 진행하지 않는다.
+    if (calibrationStage.value !== 'gaze') return
+
+    eyeTracking.setExternalGazeSource(() => seesoGaze.viewportGaze.value)
+    eyeTracking.setDetectionEnabled(false)
+
+    // SDK가 첫 점을 내기 전에 시선을 안정시키는 준비 시간이 필요하다. 이게 없으면 보정이 제대로
+    // 시작되지 않는다(프로토타입도 같은 준비 단계를 뒀다). 화면 중앙을 보게 하고 3초 센다.
+    seeSoCalibrationPoint.value = {
+      x: globalThis.window.innerWidth / 2,
+      y: globalThis.window.innerHeight / 2,
+    }
+    for (let countdown = 3; countdown >= 1; countdown -= 1) {
+      if (calibrationStage.value !== 'gaze') return
+      seeSoCalibrationHint.value = `보정 준비 중 — 화면 중앙의 점을 바라보세요 (${countdown})`
+      await new Promise((resolve) => globalThis.setTimeout(resolve, 1000))
+    }
+
+    seeSoCalibrationHint.value = '점이 나타나면 그 점을 바라보세요'
+
+    const calibrated = await runSeeSoCalibrationWithRetry()
+    if (calibrationStage.value !== 'gaze') return
+
+    // 보정에 성공했더라도 좌표가 실제로 나오는지 확인해야 한다 — 성공 콜백 뒤에 엔진이 죽는
+    // 경우가 있고, 그대로 두면 9점 보정이 표본을 한 개도 못 모은다.
+    if (!calibrated || !(await seesoGaze.waitForGaze())) {
+      rewindToEyeStateStage()
+    }
+  } finally {
+    // 어떤 경로로 끝나든(성공·실패·타임아웃·화면 이탈) 1단계 상태를 반드시 내려 2단계가 열리게 한다.
+    isSeeSoCalibrating.value = false
+    seeSoCalibrationPoint.value = null
+    seeSoCalibrationHint.value = ''
+    seeSoCalibrationNotice.value = ''
+  }
+}
+
+/**
+ * SeeSo 자체 보정(1단계)을 성공할 때까지 다시 시도한다.
+ *
+ * ## 왜 MediaPipe로 넘기지 않고 재시도하는가
+ * SeeSo는 이 서비스 시선 추적의 핵심이다. MediaPipe는 홍채 위치로 화면 좌표를 **추정**하는
+ * 방식이라 정확도가 확연히 낮아, 한 번 실패했다고 그쪽으로 넘겨 버리면 게임 품질이 크게
+ * 떨어진다. 실패는 대개 일시적(시선을 잠깐 놓침, 자세 변화)이므로 다시 하면 대부분 성공한다.
+ *
+ * ## 좌표가 끊긴 경우
+ * 단순 재보정으로는 살아나지 않는다(보정 중단·WASM 메모리 부족으로 엔진 자체가 멈춘 상태).
+ * 그래서 재시도 전에 좌표가 살아 있는지 보고, 끊겼으면 엔진을 껐다 켠 뒤 다시 보정한다.
+ *
+ * @returns 보정에 성공했으면 true.
+ */
+async function runSeeSoCalibrationWithRetry(): Promise<boolean> {
+  for (
+    let attempt = 1;
+    attempt <= SEESO_CALIBRATION_MAX_ATTEMPTS;
+    attempt += 1
+  ) {
+    if (calibrationStage.value !== 'gaze') return false
+
+    if (attempt > 1 && !(await restartSeeSoForRetry(attempt))) continue
+
+    // ⚠️ 반드시 타임아웃을 건다. 이 보정은 사용자의 시선이 잡혀야 진행되는데, 안 잡히면 SDK가
+    // 완료 콜백을 영영 부르지 않을 수 있다. 그러면 화면이 멈춘 것처럼 보여 아무것도 못 한다.
+    const succeeded = await Promise.race([
+      seesoGaze.calibrate({
+        onPoint: (x, y) => {
+          seeSoCalibrationPoint.value = { x, y }
+          seeSoCalibrationHint.value = '점을 바라보세요'
+        },
+        onProgress: (progress) => {
+          seeSoCalibrationProgress.value = progress
+          seeSoCalibrationHint.value = `보정 중 ${Math.round(progress * 100)}%`
+          // 다시 진행되기 시작했다 — 재시도 안내를 걷는다.
+          seeSoCalibrationNotice.value = ''
+        },
+        // 멈춘 이유에 따라 사용자가 해야 할 일이 다르다. "재시도 중"만 알려서는 무엇을 고쳐야
+        // 할지 알 수 없으므로, 시선이 잡히는지 여부로 안내를 나눈다.
+        onStalled: (_stall, _maxStalls, tracked) => {
+          seeSoCalibrationNotice.value = tracked
+            ? '시선이 점에서 벗어났어요 · 주황색 점을 다시 바라봐 주세요'
+            : '얼굴이 보이지 않아요 · 카메라 앞에서 화면을 바라봐 주세요'
+        },
+      }),
+      new Promise<undefined>((resolve) =>
+        globalThis.setTimeout(resolve, SEESO_CALIBRATION_TIMEOUT_MS),
+      ),
+    ])
+
+    if (succeeded === true) return true
+  }
+
+  return false
+}
+
+/**
+ * 재시도 전 준비. 좌표가 끊겼으면 엔진을 되살리고, 시선이 자리잡을 시간을 준다.
+ *
+ * @returns 이번 회차를 진행해도 되면 true. 엔진을 못 살렸으면 false(다음 회차에서 다시 시도).
+ */
+async function restartSeeSoForRetry(attempt: number): Promise<boolean> {
+  seeSoCalibrationPoint.value = null
+  seeSoCalibrationProgress.value = 0
+  seeSoCalibrationHint.value = '보정을 다시 시작하는 중이에요…'
+  seeSoCalibrationNotice.value = `보정을 처음부터 다시 시작할게요 (${attempt}/${SEESO_CALIBRATION_MAX_ATTEMPTS})`
+
+  if (!seesoGaze.isGazeFresh()) {
+    seesoGaze.stop()
+    if (!(await seesoGaze.start())) return false
+    if (calibrationStage.value !== 'gaze') return false
+    eyeTracking.setExternalGazeSource(() => seesoGaze.viewportGaze.value)
+  }
+
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 1200))
+
+  return calibrationStage.value === 'gaze'
+}
+
+/**
+ * SeeSo 보정을 끝내 완료하지 못했을 때, **눈 감기 기록 단계로 되돌린다**.
+ *
+ * ## 왜 MediaPipe로 넘기지 않는가
+ * MediaPipe 시선은 홍채 위치 기반 추정이라 정확도가 확연히 낮다. 그 상태로 게임에 들여보내면
+ * 사용자는 "되긴 되는데 이상한" 경험을 하게 되고, 무엇이 잘못됐는지도 알 수 없다. 차라리 앞
+ * 단계로 되돌려 처음부터 다시 하게 하는 편이 낫다 — 실패는 대개 자세·조명처럼 사용자가 고칠
+ * 수 있는 원인이다.
+ *
+ * ## 왜 하필 '눈 감기' 단계인가
+ * 시선 보정 바로 앞 단계다. 여기로 돌아오면 자세를 고쳐 앉은 상태에서 눈 기준값을 다시 잡고,
+ * 이어서 SeeSo 보정이 깨끗한 상태로 다시 시작된다.
+ *
+ * MediaPipe 추론을 되살리는 것은 폴백이 아니라 **필수**다 — 눈 뜨기/감기 판정은 MediaPipe
+ * 얼굴 랜드마크(EAR)로 하기 때문에, 꺼 둔 채 되돌리면 기록 자체가 되지 않는다.
+ */
+function rewindToEyeStateStage(): void {
+  // 다음 시도가 깨끗한 상태에서 시작하도록 SeeSo를 완전히 정리한다.
+  eyeTracking.setExternalGazeSource(null)
+  eyeTracking.setDetectionEnabled(true)
+  seesoGaze.stop()
+
+  const closedIndex = calibrationStages.value.indexOf('closed')
+  if (closedIndex >= 0) calibrationStageIndex.value = closedIndex
+
+  // 진행 중이던 비동기 작업(표본 수집 등)을 무효화하고 단계 상태를 초기화한다.
+  calibrationOperationGeneration += 1
+  isSamplingEyeStep.value = false
+  isSamplingGaze.value = false
+  eyeSampleFeedback.value = 'idle'
+  gazeCalibrationTargetIndex.value = 0
+  gazeCalibrationEvaluation.value = null
+
+  showToast(
+    '시선 보정을 완료하지 못했어요. 자세를 바로 하고 눈 감기 기록부터 다시 진행해 주세요.',
+  )
+}
+
+function advanceCalibrationStage() {
+  eyeSampleFeedback.value = 'idle'
+  if (calibrationStageIndex.value < calibrationStages.value.length - 1) {
+    calibrationStageIndex.value += 1
+  }
+  if (calibrationStage.value === 'gaze') {
+    eyeTracking.beginGazeCalibration()
+    gazeCalibrationTargetIndex.value = 0
+    // 게임에서 SeeSo를 쓸 거라면 보정도 **SeeSo 좌표로** 학습해야 한다. MediaPipe 좌표로 배운
+    // 보정을 SeeSo 좌표에 적용하면 원시 좌표계가 서로 달라 크게 어긋난다.
+    void startSeeSoForCalibration()
+  }
+  if (calibrationStage.value === 'done') {
+    finishCalibration()
+  }
+}
+
+function finishCalibration() {
+  if (isFriendRoom.value && !isInviteJoined.value) return
+  playCalibrationSound('complete')
+  calibrationStore.saveEyeProfile(eyeTracking.eyeProfile.value)
+  isCalibrated.value = true
+  isCalibrationOpen.value = false
+  if (isLiveSession.value && canUseWaitingRoomCommands.value) {
+    waitingSocket.sendCalibrationStatus('COMPLETED')
+    const connectedRoomId = waitingSocket.connectedRoomId.value
+    if (connectedRoomId) {
+      syncedCalibrationConnection = `${connectedRoomId}:${waitingSocket.connectionGeneration.value}`
+    }
+  }
+  showToast('시선 캘리브레이션이 완료되었어요.')
+}
+
+function handleCalibrationBack() {
+  if (isSamplingEyeStep.value || isSamplingGaze.value) return
+  if (calibrationStageIndex.value > 0) {
+    calibrationStageIndex.value -= 1
+    eyeSampleFeedback.value = 'idle'
+  } else {
+    isCalibrationOpen.value = false
+  }
+}
+
+function handleGameStart(
+  data: WaitingRoomGameStartData,
+  context: WaitingRoomSocketContext,
+) {
+  if (isFriendRoom.value) {
+    if (
+      !isInviteJoined.value ||
+      !inviteLifecycle.isCurrentConnection(context) ||
+      data.roomId !== inviteLifecycle.activeRoomId.value ||
+      data.gameName !== currentGameType.value
+    ) {
+      return
+    }
+    allowInviteRouteExit = true
+  }
+  if (isRandomRoom.value) {
+    if (
+      !isCurrentRandomWaitingContext(context) ||
+      !randomLifecycle.canHandleGameStart(data.roomId)
+    ) {
+      return
+    }
+    allowRandomRouteExit = true
+    matchSocket.close()
+  }
+  if (data.openviduUrl && data.token) {
+    mediaSession.setCredentials({
+      openviduUrl: data.openviduUrl,
+      token: data.token,
+    })
+  }
+  // 준비 화면 카메라를 놓아줘야 플레이 화면에서 다시 잡을 수 있다.
+  stopCameraStream()
+  if (game.value)
+    router.push({
+      name: 'game-play',
+      params: { gameId: game.value.id },
+      // 랜덤 매칭은 route.query에 이미 roomId(UUID)가 있지만, 초대(친구) 방은 host가 만들 때도
+      // joiner가 참가할 때도 route.query엔 4자리 room 코드만 있을 뿐 실제 roomId가 없다.
+      // 게임 화면에서 게임 세션 WebSocket(/ws/game-sessions/{roomId})에 접속하려면 필요하므로
+      // 여기서 명시적으로 채워 넣는다.
+      query: liveRoomId.value
+        ? { ...route.query, roomId: liveRoomId.value }
+        : route.query,
+    })
+}
+
+async function initInviteSession() {
+  if (!isFriendRoom.value || !game.value) return
+  const gameName = GAME_NAME_BY_ID[game.value.id]
+  const requestGeneration = inviteLifecycle.beginEntry(gameName)
+  if (requestGeneration === null) return
+  isWebcamGuideOpen.value = true
+  let enteredRoomId: string | null = null
+
+  try {
+    const token = currentAccessToken()
+    const requestedRoomCode = roomCode.value
+    const response = requestedRoomCode
+      ? await joinInviteRoom(requestedRoomCode, token)
+      : await createInviteRoom(gameName, token)
+    enteredRoomId = response.roomId
+
+    if (!inviteLifecycle.isCurrentRequest(requestGeneration)) {
+      await bestEffortLeaveInvite(response.roomId)
+      return
+    }
+    if (
+      !inviteLifecycle.markConnecting(
+        requestGeneration,
+        response.roomId,
+        gameName,
+      )
+    ) {
+      await bestEffortLeaveInvite(response.roomId)
+      return
+    }
+
+    liveRoomId.value = response.roomId
+    liveRoomCode.value = response.roomCode
+    if (response.openviduUrl && response.token) {
+      mediaSession.setCredentials({
+        openviduUrl: response.openviduUrl,
+        token: response.token,
+      })
+    }
+
+    // REST 응답에서 게스트 세션이 저장됐으므로, 신원을 공통 helper로 만든다(회원=토큰/게스트=세션).
+    liveIdentity.value = resolveIdentity()
+    if (!liveIdentity.value) {
+      inviteLifecycle.failRequest(
+        requestGeneration,
+        'UNKNOWN',
+        '대기방 연결에 필요한 사용자 정보를 찾지 못했어요.',
+      )
+      await bestEffortLeaveInvite(response.roomId)
+      clearInviteRoomBoundState()
+      return
+    }
+
+    const { role: _ignoredRole, ...currentQuery } = route.query
+    void _ignoredRole
+    await router.replace({
+      name: 'game-ready',
+      params: { gameId: game.value.id },
+      query: { ...currentQuery, mode: 'friends', room: response.roomCode },
+    })
+    if (!inviteLifecycle.isCurrentRequest(requestGeneration)) {
+      await bestEffortLeaveInvite(response.roomId)
+      return
+    }
+
+    const connected = waitingSocket.connect(response.roomId, liveIdentity.value)
+    if (!connected) {
+      inviteLifecycle.failRequest(requestGeneration, 'WAITING-010')
+      await bestEffortLeaveInvite(response.roomId)
+      clearInviteRoomBoundState()
+      return
+    }
+    inviteLifecycle.bindWaitingConnection(
+      response.roomId,
+      waitingSocket.connectionGeneration.value,
+    )
+  } catch (error) {
+    const code = error instanceof ApiError ? error.code : 'UNKNOWN'
+    const message = error instanceof ApiError ? error.message : undefined
+    if (!inviteLifecycle.failRequest(requestGeneration, code, message)) return
+    if (enteredRoomId) await bestEffortLeaveInvite(enteredRoomId)
+    clearInviteRoomBoundState()
+    showToast(inviteLifecycle.failure.value?.message ?? '')
+  }
+}
+
+function handleRetryInvite(): void {
+  const activeRoomId = inviteLifecycle.activeRoomId.value
+  const retryGeneration = inviteLifecycle.retryConnection()
+  if (!activeRoomId || retryGeneration === null) {
+    void initInviteSession()
+    return
+  }
+
+  const identity = resolveIdentity()
+  if (!identity) {
+    inviteLifecycle.failRequest(
+      retryGeneration,
+      'UNKNOWN',
+      '대기방 연결에 필요한 사용자 정보를 찾지 못했어요.',
+    )
+    return
+  }
+
+  isWebcamGuideOpen.value = true
+  liveRoomId.value = activeRoomId
+  liveRoomCode.value = roomCode.value
+  liveIdentity.value = identity
+  try {
+    if (!waitingSocket.connect(activeRoomId, identity)) {
+      inviteLifecycle.failRequest(retryGeneration, 'WAITING-010')
+      return
+    }
+    inviteLifecycle.bindWaitingConnection(
+      activeRoomId,
+      waitingSocket.connectionGeneration.value,
+    )
+  } catch {
+    inviteLifecycle.failRequest(retryGeneration, 'UNKNOWN')
+  }
+}
+
+// 랜덤방: 매칭이 성사되면 방 멤버십이 이미 성립돼 있으므로 REST join 없이 roomId로 바로 접속한다.
+// roomId는 GameRoomDialog의 매칭 결과가 쿼리(roomId)로 전달한다. 미디어 토큰은 GAME_START로만 온다.
+function initRandomSession() {
+  if (!isRandomRoom.value || !game.value) return
+  const roomId = String(route.query.roomId ?? '')
+  const gameType = currentGameType.value
+  if (!roomId || !gameType) {
+    randomLifecycle.fail('랜덤 대기방 정보를 확인하지 못했어요.')
+    return
+  }
+  const identity = resolveIdentity()
+  if (!identity) {
+    randomLifecycle.fail('대기방 연결에 필요한 사용자 정보를 찾지 못했어요.')
+    return
+  }
+  randomLifecycle.initialize(roomId, gameType)
+  liveRoomId.value = roomId
+  liveIdentity.value = identity
+  try {
+    matchSocket.connect(identity)
+    waitingSocket.connect(roomId, identity)
+  } catch {
+    randomLifecycle.fail('대기방 연결을 시작하지 못했어요.')
+  }
+}
+
+async function handleCopyRoomCode() {
+  if (!isHost.value || !displayRoomCode.value) return
+  try {
+    await globalThis.navigator.clipboard.writeText(displayRoomCode.value)
+    showToast('방 코드를 복사했어요!')
+  } catch {
+    /* no-op */
+  }
+}
+
+function handleKeydown(event: globalThis.KeyboardEvent) {
+  if (event.key !== 'Escape') return
+  // 시작 카운트다운은 ESC로도 닫지 않는다 — 닫히면 시작 타이머까지 취소된다.
+  if (isGameStartDialogOpen.value) return
+  if (isCalibrationOpen.value) isCalibrationOpen.value = false
+  else if (isCameraErrorOpen.value) isCameraErrorOpen.value = false
+}
+
+function attachStreamTo(video: globalThis.HTMLVideoElement | null) {
+  if (!video || !cameraStream.value) return
+  video.srcObject = cameraStream.value
+  void video.play().catch(() => undefined)
+}
+
+async function attachPreviewStream() {
+  await nextTick()
+  attachStreamTo(previewVideo.value)
+  attachStreamTo(panelVideo.value)
+}
+
+watch(cameraStream, attachPreviewStream)
+watch(panelVideo, (video) => attachStreamTo(video))
+// 내 카메라와 접속 토큰이 모두 준비되면 대기방에서 피어 미디어 연결을 시작한다.
+watch(
+  [cameraStream, () => mediaSession.credentials?.token],
+  () => void connectReadyMedia(),
+)
+watch(
+  [
+    () => isWebcamGuideOpen.value && showPreparationUi.value,
+    isCalibrationOpen,
+    isCameraErrorOpen,
+    isGameStartDialogOpen,
+  ],
+  async ([guideOpen, calibrationOpen, errorOpen]) => {
+    const hasOpenDialog = guideOpen || calibrationOpen || errorOpen
+    if (typeof globalThis.document === 'undefined') return
+
+    if (hasOpenDialog) {
+      if (!isBodyScrollLocked) {
+        previousBodyOverflow = globalThis.document.body.style.overflow
+        isBodyScrollLocked = true
+      }
+      globalThis.document.body.style.overflow = 'hidden'
+      await nextTick()
+      const initialFocus =
+        dialogRef.value?.querySelector<globalThis.HTMLElement>(
+          '[data-dialog-initial-focus]',
+        )
+      ;(initialFocus ?? dialogRef.value)?.focus()
+    } else {
+      globalThis.document.body.style.overflow = previousBodyOverflow
+      previousBodyOverflow = ''
+      isBodyScrollLocked = false
+    }
+  },
+  { immediate: true },
+)
+
+watch(isCalibrationOpen, (isOpen) => {
+  if (isOpen) void attachPreviewStream()
+})
+
+if (typeof globalThis.window !== 'undefined')
+  globalThis.window.addEventListener('keydown', handleKeydown)
+
+onMounted(() => {
+  // 부팅 시 확보에 실패했을 수 있으므로 여기서 한 번 더 시도한다(이미 있으면 아무 일도 하지 않음).
+  // 게임 시작 시점의 입장권 발급은 동기라 기다릴 수 없으니, 카메라·캘리브레이션에 쓰는 시간
+  // 동안 신원을 미리 준비해 둔다.
+  void ensureIdentity()
+  if (isRandomRoom.value) initRandomSession()
+  else void initInviteSession()
+})
+
+onBeforeRouteLeave(async () => {
+  if (isRandomRoom.value && !allowRandomRouteExit) {
+    await cleanupRandomFlowForExit()
+    allowRandomRouteExit = true
+  }
+  if (isFriendRoom.value && !allowInviteRouteExit) {
+    await cleanupInviteFlowForExit()
+    allowInviteRouteExit = true
+  }
+  return true
+})
+
+onBeforeUnmount(() => {
+  if (isFriendRoom.value && !allowInviteRouteExit) {
+    const shouldLeave = ['CONNECTING', 'JOINED'].includes(inviteFlowState.value)
+    const roomId = inviteLifecycle.activeRoomId.value ?? liveRoomId.value
+    inviteLifecycle.beginLeaving()
+    if (shouldLeave && roomId) void bestEffortLeaveInvite(roomId)
+  } else {
+    inviteLifecycle.invalidateRequest()
+  }
+  stopCameraStream()
+  clearGameStartCountdown()
+  waitingSocket.close()
+  matchSocket.close()
+  if (typeof globalThis.document !== 'undefined')
+    globalThis.document.body.style.overflow = previousBodyOverflow
+  isBodyScrollLocked = false
+  if (typeof globalThis.window !== 'undefined')
+    globalThis.window.removeEventListener('keydown', handleKeydown)
+})
+</script>
+
+<template>
+  <section v-if="game" class="game-room-page">
+    <button type="button" class="back back--button" @click="handleLeaveRoom">
+      ← 게임 목록으로
+    </button>
+
+    <!-- 음성 대화·카메라 송출 설정 — 사람 상대가 있는 대기방(친구·랜덤)에서만 의미가 있다. -->
+    <div v-if="isMultiplayer" class="media-controls-dock">
+      <GameMediaControls :has-voice-chat="true" :has-bgm="false" />
+    </div>
+
+    <header class="room-header">
+      <div>
+        <span class="room-header__mode" aria-hidden="true">
+          <svg
+            v-if="mode === 'random'"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <rect x="3.5" y="3.5" width="17" height="17" rx="5" />
+            <circle
+              cx="8.5"
+              cy="8.5"
+              r="1.1"
+              fill="currentColor"
+              stroke="none"
+            />
+            <circle
+              cx="15.5"
+              cy="8.5"
+              r="1.1"
+              fill="currentColor"
+              stroke="none"
+            />
+            <circle cx="12" cy="12" r="1.1" fill="currentColor" stroke="none" />
+            <circle
+              cx="8.5"
+              cy="15.5"
+              r="1.1"
+              fill="currentColor"
+              stroke="none"
+            />
+            <circle
+              cx="15.5"
+              cy="15.5"
+              r="1.1"
+              fill="currentColor"
+              stroke="none"
+            />
+          </svg>
+          <svg
+            v-else-if="mode === 'friends'"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+          >
+            <circle cx="8.5" cy="8" r="3" />
+            <path d="M2.5 19c.6-3.4 3-5.2 6-5.2s5.4 1.8 6 5.2" />
+            <circle cx="16.5" cy="8.5" r="2.6" opacity="0.7" />
+            <path
+              d="M13.6 13.6c1-.6 2-.9 3-.9 2.6 0 4.7 1.6 5.3 4.6"
+              opacity="0.7"
+            />
+          </svg>
+          <svg
+            v-else
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <rect x="2.5" y="7" width="19" height="10" rx="5" />
+            <path d="M7 10v4M5 12h4" />
+            <circle cx="16" cy="10.5" r="1" fill="currentColor" stroke="none" />
+            <circle
+              cx="18.2"
+              cy="12.7"
+              r="1"
+              fill="currentColor"
+              stroke="none"
+            />
+          </svg>
+        </span>
+        <h1>{{ roomTitle }}</h1>
+        <p>{{ roomDescription }}</p>
+      </div>
+      <div class="room-header__actions">
+        <div
+          v-if="isFriendRoom && isInviteJoined"
+          class="room-code"
+          aria-label="방 코드"
+        >
+          <span>방 코드</span>
+          <b
+            v-for="(digit, index) in displayRoomCode.padEnd(4, '•').slice(0, 4)"
+            :key="index"
+            >{{ digit }}</b
+          >
+          <button
+            v-if="isHost && displayRoomCode"
+            type="button"
+            class="room-code__copy"
+            aria-label="방 코드 복사"
+            @click="handleCopyRoomCode"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <rect x="8.5" y="8.5" width="11" height="11" rx="2.4" />
+              <path
+                d="M15.5 8.5V6.4A1.9 1.9 0 0 0 13.6 4.5H6.4A1.9 1.9 0 0 0 4.5 6.4v7.2a1.9 1.9 0 0 0 1.9 1.9h2.1"
+              />
+            </svg>
+          </button>
+        </div>
+        <button
+          type="button"
+          :aria-label="isRandomRoom ? '매칭 취소' : '방 나가기'"
+          :disabled="
+            randomLifecycle.isLeaving.value || inviteFlowState === 'LEAVING'
+          "
+          @click="handleLeaveRoom"
+        >
+          {{ isRandomRoom ? '매칭 취소' : '방 나가기' }}
+        </button>
+      </div>
+    </header>
+
+    <section
+      v-if="
+        isFriendRoom && ['ENTERING', 'CONNECTING'].includes(inviteFlowState)
+      "
+      class="room-join-error invite-entry-status"
+      role="status"
+      aria-live="polite"
+    >
+      <i class="random-rematch-status__spinner" aria-hidden="true" />
+      <strong>초대방에 입장하고 있어요.</strong>
+      <p>
+        {{
+          inviteFlowState === 'ENTERING'
+            ? '초대방 정보를 확인하고 있어요.'
+            : '대기방 연결을 확인하고 있어요.'
+        }}
+      </p>
+    </section>
+
+    <section
+      v-if="isFriendRoom && inviteFlowState === 'FAILED' && inviteError"
+      class="room-join-error"
+      role="alert"
+    >
+      <strong>입장하지 못했어요</strong>
+      <p>{{ inviteError }}</p>
+      <div class="room-join-error__actions">
+        <button
+          v-if="canRetryInvite"
+          type="button"
+          class="room-join-error__retry"
+          @click="handleRetryInvite"
+        >
+          다시 시도
+        </button>
+        <button
+          type="button"
+          class="room-join-error__back"
+          @click="handleLeaveRoom"
+        >
+          돌아가기
+        </button>
+      </div>
+    </section>
+
+    <section
+      v-if="isFriendRoom && inviteFlowState === 'CLOSED'"
+      class="room-join-error invite-entry-status"
+      role="status"
+      aria-live="polite"
+    >
+      <strong>초대방이 종료되었어요.</strong>
+      <p>게임 상세로 돌아가 새로운 방을 만들거나 다시 참여해 주세요.</p>
+      <div class="room-join-error__actions">
+        <button
+          type="button"
+          class="room-join-error__back"
+          @click="handleLeaveRoom"
+        >
+          게임 상세로
+        </button>
+      </div>
+    </section>
+
+    <section
+      v-if="isRandomStatusVisible"
+      class="room-join-error random-rematch-status"
+      :role="randomFlowState === 'ERROR' ? 'alert' : 'status'"
+      aria-live="polite"
+    >
+      <i
+        v-if="randomFlowState !== 'ERROR' || isRetryingMatch"
+        class="random-rematch-status__spinner"
+        aria-hidden="true"
+      />
+      <strong>{{ randomStatusTitle }}</strong>
+      <p>{{ randomStatusMessage }}</p>
+      <div class="room-join-error__actions">
+        <button
+          v-if="canRetryRandomMatch"
+          type="button"
+          class="room-join-error__retry"
+          @click="handleRetryRandomMatch"
+        >
+          다시 찾기
+        </button>
+        <button
+          type="button"
+          class="room-join-error__back"
+          :disabled="randomLifecycle.isLeaving.value"
+          @click="handleLeaveRoom"
+        >
+          나가기
+        </button>
+      </div>
+    </section>
+
+    <section
+      v-if="showPreparationUi && !isRandomStatusVisible"
+      class="participant-grid"
+      :class="{ 'participant-grid--solo': !isMultiplayer }"
+      aria-label="참가자 준비 상태"
+    >
+      <article class="participant-card participant-card--me">
+        <header>
+          <div>
+            <span class="participant-role">{{ myRoomRole }}</span>
+            <h2>나</h2>
+          </div>
+          <span v-if="ownPreparationComplete" class="complete-badge">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M5 13l4 4L19 7"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.4"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+            완료
+          </span>
+        </header>
+        <div class="participant-visual">
+          <video
+            v-if="isCameraConnected"
+            ref="panelVideo"
+            class="participant-visual__camera"
+            autoplay
+            muted
+            playsinline
+            aria-label="내 웹캠 미리보기"
+          ></video>
+          <img
+            v-else
+            :src="game?.mascotImage ?? ''"
+            alt="내 게임 준비 상태 마스코트"
+            draggable="false"
+          />
+          <span>{{ isCameraConnected ? '내 웹캠' : '내 준비 상태' }}</span>
+        </div>
+        <ol class="my-progress" aria-label="나의 게임 준비 진행 단계">
+          <li
+            :class="{
+              complete: isCameraConnected,
+              error: !isCameraConnected,
+            }"
+          >
+            <b aria-hidden="true">
+              <svg v-if="isCameraConnected" viewBox="0 0 24 24">
+                <path
+                  d="M5 13l4 4L19 7"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.4"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+              <svg v-else viewBox="0 0 24 24">
+                <path
+                  d="M6 6l12 12M18 6L6 18"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.4"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </b>
+            <span>카메라</span>
+            <small>
+              {{ isCameraConnected ? '완료' : '카메라 연결 필요' }}
+            </small>
+          </li>
+          <li :class="{ complete: isCalibrated }">
+            <b aria-hidden="true">
+              <svg v-if="isCalibrated" viewBox="0 0 24 24">
+                <path
+                  d="M5 13l4 4L19 7"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.4"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+              <template v-else>2</template>
+            </b>
+            <span>캘리브레이션</span>
+            <small>{{ isCalibrated ? '완료' : '미완료' }}</small>
+          </li>
+          <li :class="{ complete: ownPreparationComplete }">
+            <b aria-hidden="true">
+              <svg v-if="ownPreparationComplete" viewBox="0 0 24 24">
+                <path
+                  d="M5 13l4 4L19 7"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.4"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+              <template v-else>3</template>
+            </b>
+            <span>준비 상태</span>
+            <small>{{ ownPreparationComplete ? '완료' : '미완료' }}</small>
+          </li>
+        </ol>
+        <button
+          v-if="actionLabel"
+          class="participant-action"
+          type="button"
+          :disabled="actionDisabled"
+          @click="handlePrimaryAction"
+        >
+          <template v-if="permissionStatus === 'requesting'">
+            <i class="participant-action__spinner" aria-hidden="true" />
+            카메라 권한 요청 중
+          </template>
+          <template v-else>{{ actionLabel }}</template>
+        </button>
+      </article>
+
+      <article
+        v-if="isMultiplayer"
+        class="participant-card participant-card--opponent"
+      >
+        <header>
+          <div>
+            <span class="participant-role">{{
+              liveOpponent?.roomRole ?? 'PLAYER'
+            }}</span>
+            <h2>{{ opponentName }}</h2>
+          </div>
+          <span v-if="isOpponentReady" class="complete-badge">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M5 13l4 4L19 7"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.4"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+            완료
+          </span>
+        </header>
+        <div class="participant-visual participant-visual--opponent">
+          <video
+            v-if="hasPeerCamera"
+            ref="opponentVideoRef"
+            class="participant-visual__camera participant-visual__camera--peer"
+            :class="{ 'camera-off': isOpponentCameraOff }"
+            autoplay
+            playsinline
+            :aria-label="`${opponentName} 웹캠 영상`"
+          ></video>
+          <img
+            v-else
+            :src="game.image"
+            :alt="`${opponentName} 준비 상태 안내 이미지`"
+            draggable="false"
+          />
+          <span>{{
+            hasPeerCamera
+              ? isOpponentReady
+                ? '상대 준비 완료'
+                : '상대 접속됨'
+              : '상대 준비 대기'
+          }}</span>
+          <p
+            class="opponent-ready-note"
+            :class="{ 'opponent-ready-note--waiting': !isOpponentReady }"
+          >
+            {{
+              isOpponentReady
+                ? `${opponentName}의 준비가 완료되었습니다.`
+                : `${opponentName}의 준비 상태를 기다리고 있어요.`
+            }}
+          </p>
+        </div>
+      </article>
+    </section>
+  </section>
+  <section v-else class="missing">
+    <h1>게임을 찾을 수 없어요.</h1>
+    <RouterLink to="/games">게임 목록으로</RouterLink>
+  </section>
+
+  <Teleport to="body">
+    <Transition name="dialog-pop">
+      <div
+        v-if="isWebcamGuideOpen && showPreparationUi"
+        class="ready-dialog-backdrop"
+      >
+        <section
+          ref="dialogRef"
+          class="ready-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="webcam-guide-title"
+          aria-describedby="webcam-guide-description"
+        >
+          <span class="ready-dialog__icon" aria-hidden="true">
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path
+                d="M4 8a2 2 0 0 1 2-2h2l1.2-1.6A2 2 0 0 1 10.8 3.6h2.4a2 2 0 0 1 1.6.8L16 6h2a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"
+              />
+              <circle cx="12" cy="13" r="3.2" />
+            </svg>
+          </span>
+          <h2 id="webcam-guide-title">게임 준비를 위해 웹캠을 켜주세요</h2>
+          <p id="webcam-guide-description">
+            게임 중 시선 인식 기능을 사용하기 위해 카메라 권한이 필요해요.
+          </p>
+          <p class="ready-dialog__notice">
+            카메라 영상은 게임 진행에 필요한 경우에만 사용됩니다.
+          </p>
+          <div class="ready-dialog__actions">
+            <button
+              type="button"
+              class="primary"
+              data-dialog-initial-focus
+              @click="handleRequestCamera"
+            >
+              웹캠 켜고 준비하기</button
+            ><button type="button" class="secondary" @click="handleLeaveRoom">
+              게임 상세로 돌아가기
+            </button>
+          </div>
+        </section>
+      </div>
+    </Transition>
+
+    <Transition name="dialog-pop">
+      <div v-if="isCameraErrorOpen" class="ready-dialog-backdrop">
+        <section
+          ref="dialogRef"
+          class="ready-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="camera-error-title"
+          aria-describedby="camera-error-description"
+        >
+          <span
+            class="ready-dialog__icon ready-dialog__icon--error"
+            aria-hidden="true"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path d="M12 3.5l9.3 16a1 1 0 0 1-.9 1.5H3.6a1 1 0 0 1-.9-1.5z" />
+              <path d="M12 9.5v4.2M12 17h.01" />
+            </svg>
+          </span>
+          <h2 id="camera-error-title">카메라 권한을 확인해 주세요</h2>
+          <p id="camera-error-description">
+            {{
+              permissionStatus === 'denied'
+                ? '카메라 권한이 허용되지 않아 게임을 시작할 수 없어요. 브라우저 주소창의 카메라 권한 설정을 확인한 뒤 다시 시도해 주세요.'
+                : '카메라를 사용할 수 없어요. 연결된 카메라와 브라우저 지원 여부를 확인해 주세요.'
+            }}
+          </p>
+          <div class="ready-dialog__actions ready-dialog__actions--single">
+            <button
+              type="button"
+              class="primary"
+              data-dialog-initial-focus
+              @click="handleLeaveRoom"
+            >
+              게임 상세로 돌아가기
+            </button>
+          </div>
+        </section>
+      </div>
+    </Transition>
+
+    <Transition name="dialog-pop">
+      <div
+        v-if="isCalibrationOpen"
+        class="ready-dialog-backdrop ready-dialog-backdrop--calibration"
+      >
+        <section
+          ref="dialogRef"
+          class="calibration-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="calibration-title"
+          aria-describedby="calibration-description"
+        >
+          <header>
+            <div>
+              <span
+                >STEP {{ calibrationStepNumber }} /
+                {{ totalCalibrationSteps }}</span
+              >
+              <h2 id="calibration-title">{{ calibrationStageTitle }}</h2>
+              <p id="calibration-description">
+                {{ calibrationStageDescription }}
+              </p>
+            </div>
+            <button
+              type="button"
+              aria-label="캘리브레이션 닫기"
+              @click="isCalibrationOpen = false"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M6 6l12 12M18 6L6 18"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </button>
+          </header>
+          <div class="calibration-progress" aria-label="캘리브레이션 진행률">
+            <span
+              :style="{
+                transform: `scaleX(${calibrationStepNumber / totalCalibrationSteps})`,
+              }"
+            />
+          </div>
+          <div class="calibration-stage">
+            <video
+              v-if="cameraStream && isCameraConnected"
+              ref="previewVideo"
+              autoplay
+              muted
+              playsinline
+              aria-label="내 카메라 로컬 프리뷰"
+            />
+            <img
+              v-else
+              :src="game?.mascotImage ?? ''"
+              alt="카메라 연결 전 안내 마스코트"
+              draggable="false"
+            />
+            <div
+              v-if="!isCameraConnected"
+              class="calibration-camera-status"
+              role="status"
+              aria-live="polite"
+            >
+              <strong>카메라가 연결되지 않았어요</strong>
+              <span>카메라를 연결한 뒤 캘리브레이션을 진행해 주세요.</span>
+            </div>
+
+            <!-- 눈 뜬/감은 기준 기록 단계: 실시간 얼굴 인식 상태와 기록 진행 상황을 보여준다 -->
+            <template
+              v-if="
+                isCameraConnected &&
+                (calibrationStage === 'open' || calibrationStage === 'closed')
+              "
+            >
+              <div class="calibration-live-status" role="status">
+                <span v-if="!eyeTracking.faceDetected.value" class="warn">
+                  얼굴이 인식되지 않았어요. 카메라를 정면으로 봐 주세요.
+                </span>
+                <span v-else-if="isSamplingEyeStep" class="recording">
+                  기록 중입니다 · 자세를 유지해 주세요
+                </span>
+                <span
+                  v-else-if="eyeSampleFeedback === 'success'"
+                  class="success"
+                >
+                  기록 완료!
+                </span>
+                <span
+                  v-else-if="eyeSampleFeedback === 'insufficient'"
+                  class="warn"
+                >
+                  샘플이 부족했어요. 다시 시도해 주세요.
+                </span>
+                <span v-else>준비되면 아래 버튼을 눌러 기록을 시작하세요.</span>
+              </div>
+            </template>
+
+            <!-- 시선 좌표 보정 단계.
+                 점은 다이얼로그 안이 아니라 **뷰포트 전체**에 띄운다(아래 Teleport). 시선 보정을
+                 뷰포트 좌표계에서 학습해야, 크기가 다른 게임 화면에서도 같은 보정값을 그대로 쓸
+                 수 있기 때문이다(gaze-calibration.ts의 viewportPointToElement 주석 참고).
+                 다이얼로그 안에는 카메라 프리뷰만 남는다. -->
+            <template v-else-if="calibrationStage === 'gaze'" />
+          </div>
+          <div class="calibration-controls">
+            <!-- 1단계(SeeSo 자체 보정)가 도는 동안에는 사용자가 할 일이 "점 응시"뿐이므로,
+                 2단계용 지점 카운터 대신 진행 상태를 보여주고 버튼을 잠근다. 그러지 않으면
+                 무엇을 해야 하는지 알 수 없고 '다음 지점'을 눌러도 반응이 없어 멈춘 것처럼 보인다. -->
+            <div
+              v-if="isSeeSoCalibrating"
+              class="calibration-point-status"
+              :class="{
+                'calibration-point-status--retry': seeSoCalibrationNotice,
+              }"
+              role="status"
+              aria-live="polite"
+            >
+              <template v-if="seeSoCalibrationNotice">{{
+                seeSoCalibrationNotice
+              }}</template>
+              <template v-else
+                >자동 보정 중 · 주황색 점을 계속 바라봐 주세요 ({{
+                  Math.round(seeSoCalibrationProgress * 100)
+                }}%)</template
+              >
+            </div>
+            <div
+              v-else-if="calibrationStage === 'gaze'"
+              class="calibration-point-status"
+              role="status"
+              aria-live="polite"
+            >
+              지점 {{ gazeCalibrationTargetIndex + 1 }} /
+              {{ eyeTracking.gazeCalibrationTargets.length }}
+            </div>
+            <footer>
+              <button
+                type="button"
+                class="secondary"
+                :disabled="
+                  isSamplingEyeStep || isSamplingGaze || isSeeSoCalibrating
+                "
+                @click="handleCalibrationBack"
+              >
+                {{ calibrationBackLabel }}</button
+              ><button
+                type="button"
+                class="primary"
+                data-dialog-initial-focus
+                :disabled="
+                  isSamplingEyeStep ||
+                  isSamplingGaze ||
+                  isSeeSoCalibrating ||
+                  !isCameraConnected
+                "
+                @click="handleCalibrationNext"
+              >
+                {{ calibrationPrimaryLabel }}
+              </button>
+            </footer>
+          </div>
+        </section>
+      </div>
+    </Transition>
+
+    <!-- 시선 보정 점. 뷰포트 전체를 기준으로 배치해야 보정이 화면 좌표계에서 학습된다.
+         다이얼로그(z-index 30) 위에 떠야 하므로 더 높은 층에 둔다. 클릭은 통과시켜 아래 버튼을
+         계속 누를 수 있게 한다. -->
+    <div
+      v-if="
+        isCalibrationOpen && calibrationStage === 'gaze' && isCameraConnected
+      "
+      class="gaze-target-overlay"
+      :class="{ 'gaze-target-overlay--seeso': isSeeSoCalibrating }"
+      aria-hidden="true"
+    >
+      <!-- 1단계: SeeSo 자체 보정. 화면을 어둡게 덮어 점에만 집중하게 하고, 지금 무엇을 해야
+           하는지 안내 문구를 띄운다. 이 동안 9점 보정 점은 보이지 않는다. -->
+      <template v-if="isSeeSoCalibrating">
+        <i
+          class="calibration-target calibration-target--seeso"
+          :style="seeSoCalibrationPointStyle"
+        />
+        <p class="gaze-target-overlay__hint">{{ seeSoCalibrationHint }}</p>
+      </template>
+      <!-- 2단계: 9점 개인 보정. 1단계가 끝난 뒤에만 보인다. -->
+      <i
+        v-else
+        class="calibration-target"
+        :style="gazeCalibrationTargetStyle"
+      />
+    </div>
+
+    <GameStartCountdownModal
+      :open="isGameStartDialogOpen"
+      :countdown="countdown"
+    />
+  </Teleport>
+</template>
+
+<style scoped>
+.game-room-page {
+  width: min(100%, 1040px);
+  margin: 0 auto;
+  padding: 22px 0 52px;
+}
+/* 음성·카메라 컨트롤 바 — 게임 화면과 같은 위치(왼쪽 아래)에 띄워 조작감을 통일한다. */
+.media-controls-dock {
+  position: fixed;
+  bottom: 18px;
+  left: 18px;
+  z-index: 40;
+}
+/* 상대가 카메라 송출을 껐을 때 — 마지막 프레임이 남지 않게 검게 가린다. */
+video.camera-off {
+  filter: brightness(0);
+}
+.back {
+  color: var(--color-muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+.back--button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+.room-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 22px;
+  margin: 22px 0 18px;
+}
+.room-header > div:first-child {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px 12px;
+  align-items: center;
+}
+.room-header__mode {
+  grid-row: span 2;
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border-radius: 12px;
+  background: var(--color-blue-soft);
+  font-size: 19px;
+}
+.room-header__mode svg {
+  width: 20px;
+  height: 20px;
+}
+.room-header h1 {
+  margin: 0;
+  color: var(--color-ink);
+  font-size: clamp(25px, 3vw, 34px);
+}
+.room-header p {
+  grid-column: 2;
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 14px;
+}
+.room-header__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.room-header__actions > button,
+.secondary {
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
+  color: var(--color-ink);
+  background: #fff;
+  font-weight: 800;
+  cursor: pointer;
+}
+.room-header__actions > button:hover,
+.secondary:hover {
+  border-color: var(--color-accent-blue);
+  color: var(--color-accent-blue);
+}
+.room-code {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid var(--color-line);
+  border-radius: 11px;
+  background: var(--color-surface-soft);
+}
+.room-code span {
+  margin-right: 4px;
+  color: var(--color-muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+.room-code b {
+  display: grid;
+  width: 28px;
+  height: 30px;
+  place-items: center;
+  border: 1px solid var(--color-line);
+  border-radius: 7px;
+  color: var(--color-accent-blue);
+  background: #fff;
+  font-size: 18px;
+}
+.room-code__copy {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  margin-left: 4px;
+  place-items: center;
+  border: 1px solid var(--color-line);
+  border-radius: 50%;
+  color: var(--color-muted);
+  background: #fff;
+  cursor: pointer;
+  transition:
+    background-color var(--duration-fast) ease,
+    color var(--duration-fast) ease,
+    border-color var(--duration-fast) ease;
+}
+.room-code__copy svg {
+  width: 16px;
+  height: 16px;
+}
+.room-code__copy:hover {
+  border-color: var(--color-accent-blue);
+  color: var(--color-accent-blue);
+  background: var(--color-blue-soft);
+}
+.participant-role {
+  color: var(--color-accent-blue);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+}
+.complete {
+  color: #278957;
+}
+.room-join-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+  padding: 28px 20px;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-card);
+  background: #fff;
+  text-align: center;
+}
+.room-join-error strong {
+  font-size: 18px;
+}
+.room-join-error p {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 14px;
+}
+.room-join-error__actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+}
+.room-join-error__retry,
+.room-join-error__back {
+  padding: 10px 18px;
+  border-radius: 10px;
+  font: inherit;
+  font-weight: 800;
+  cursor: pointer;
+}
+.random-rematch-status {
+  min-height: 220px;
+  justify-content: center;
+}
+.random-rematch-status__spinner {
+  width: 34px;
+  height: 34px;
+  border: 3px solid var(--color-line);
+  border-top-color: var(--color-accent-blue);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+.room-join-error__retry {
+  border: 0;
+  color: #fff;
+  background: var(--color-accent-blue);
+}
+.room-join-error__back {
+  border: 1px solid var(--color-line);
+  color: var(--color-ink);
+  background: #fff;
+}
+.participant-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 16px;
+}
+.participant-grid--solo {
+  grid-template-columns: minmax(0, 760px);
+  justify-content: center;
+}
+.participant-card {
+  padding: 18px;
+  border: 1px solid var(--color-line);
+  border-radius: 18px;
+  background: #fff;
+  box-shadow: var(--shadow-card);
+}
+.participant-card--me {
+  border-color: #d9e8df;
+}
+.participant-card header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.participant-card h2 {
+  margin: 3px 0 0;
+  color: var(--color-ink);
+  font-size: 20px;
+}
+.complete-badge {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 4px;
+  padding: 6px 9px;
+  border-radius: 99px;
+  color: #278957;
+  background: #e6f7eb;
+  font-size: 11px;
+  font-weight: 800;
+}
+.complete-badge svg {
+  width: 12px;
+  height: 12px;
+}
+/* 상대 카드의 완료 배지는 내 카드(초록)와 구분되게 연한 빨간색으로 보여준다. */
+.participant-card--opponent .complete-badge {
+  color: #d64545;
+  background: #fdecec;
+}
+.participant-visual {
+  position: relative;
+  display: grid;
+  min-height: 340px;
+  place-items: center;
+  margin-top: 13px;
+  overflow: hidden;
+  border-radius: 13px;
+  background: #f7f4ff;
+}
+.participant-visual--opponent {
+  background: #f2fbf5;
+}
+.participant-visual img {
+  width: min(46%, 145px);
+  height: 125px;
+  object-fit: contain;
+  user-select: none;
+}
+.participant-visual__camera {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  transform: scaleX(-1);
+}
+.participant-visual__camera--peer {
+  transform: none;
+}
+.participant-visual span {
+  position: absolute;
+  bottom: 10px;
+  left: 10px;
+  padding: 5px 8px;
+  border-radius: 99px;
+  color: var(--color-muted);
+  background: rgba(255, 255, 255, 0.9);
+  font-size: 11px;
+  font-weight: 800;
+}
+/* 상대 준비 상태 안내: 시각 영역 오른쪽 위(완료 배지 바로 아래)에 겹쳐 보여준다.
+   대기 중엔 연두색, 준비 완료면 빨간색으로 바뀐다. */
+.opponent-ready-note {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  margin: 0;
+  padding: 5px 8px;
+  border-radius: 99px;
+  color: #d64545;
+  background: rgba(255, 255, 255, 0.9);
+  font-size: 11px;
+  font-weight: 800;
+}
+.opponent-ready-note--waiting {
+  color: #35a968;
+}
+.my-progress {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin: 14px 0;
+  padding: 0;
+  list-style: none;
+}
+.my-progress li {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: auto auto;
+  column-gap: 6px;
+  padding: 9px;
+  border-radius: 10px;
+  color: var(--color-muted);
+  background: var(--color-surface-soft);
+  transition:
+    background-color var(--duration-fast) ease,
+    color var(--duration-fast) ease,
+    border-color var(--duration-fast) ease;
+}
+.my-progress b {
+  grid-row: span 2;
+  display: grid;
+  width: 21px;
+  height: 21px;
+  place-items: center;
+  border: 1px solid var(--color-line);
+  border-radius: 50%;
+  font-size: 11px;
+  transition:
+    background-color var(--duration-fast) ease,
+    border-color var(--duration-fast) ease;
+}
+.my-progress b svg {
+  width: 12px;
+  height: 12px;
+}
+.my-progress span {
+  font-size: 11px;
+  font-weight: 700;
+}
+.my-progress small {
+  font-size: 11px;
+  font-weight: 800;
+}
+.my-progress .complete {
+  color: #278957;
+}
+.my-progress .complete b {
+  border-color: #75c694;
+  background: #e6f7eb;
+}
+.my-progress .error {
+  border: 1px solid #f1caca;
+  color: #b75555;
+  background: #fff0f0;
+}
+.my-progress .error b {
+  border-color: #d98282;
+  background: #ffe7e7;
+}
+.participant-action,
+.primary {
+  min-height: 43px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 10px;
+  color: #fff;
+  background: var(--color-accent-blue);
+  font-weight: 800;
+  cursor: pointer;
+}
+.participant-action {
+  width: 100%;
+}
+.participant-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.participant-action__spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  margin-right: 7px;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-top-color: #fff;
+  border-radius: 50%;
+  vertical-align: -2px;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.ready-dialog-backdrop {
+  position: fixed;
+  z-index: 30;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(13, 26, 56, 0.52);
+}
+.ready-dialog,
+.calibration-dialog {
+  width: min(100%, 470px);
+  max-height: min(760px, calc(100vh - 40px));
+  overflow: auto;
+  box-sizing: border-box;
+  padding: 28px;
+  border-radius: 20px;
+  background: #fff;
+  box-shadow: 0 20px 60px rgba(9, 23, 55, 0.26);
+}
+.ready-dialog__icon {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--color-accent-blue);
+  background: var(--color-blue-soft);
+  font-weight: 900;
+}
+.ready-dialog__icon svg {
+  width: 22px;
+  height: 22px;
+}
+.ready-dialog__icon--error {
+  color: #b75555;
+  background: #fff0f0;
+}
+.ready-dialog h2 {
+  margin: 14px 0 8px;
+  color: var(--color-ink);
+  font-size: 24px;
+}
+.ready-dialog p {
+  color: var(--color-muted);
+  line-height: 1.65;
+}
+.ready-dialog__notice {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--color-surface-soft);
+  font-size: 13px;
+}
+.ready-dialog__actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 9px;
+  margin-top: 20px;
+}
+.ready-dialog__actions button {
+  width: 100%;
+}
+/* 버튼이 하나뿐인 팝업(카메라 권한 오류)은 버튼을 가운데에 둔다. */
+.ready-dialog__actions--single {
+  grid-template-columns: minmax(0, 220px);
+  justify-content: center;
+}
+.calibration-dialog {
+  width: min(96vw, 1400px);
+  max-height: min(94vh, 960px);
+}
+.calibration-dialog header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+}
+.calibration-dialog header span {
+  color: var(--color-accent-blue);
+  font-size: 12px;
+  font-weight: 800;
+}
+.calibration-dialog h2 {
+  margin: 4px 0;
+  color: var(--color-ink);
+  font-size: 26px;
+}
+.calibration-dialog header p {
+  margin: 0;
+  color: var(--color-muted);
+}
+.calibration-dialog header button {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  color: var(--color-ink);
+  background: var(--color-surface-soft);
+  font-size: 25px;
+  cursor: pointer;
+  transition: background-color var(--duration-fast) ease;
+}
+.calibration-dialog header button svg {
+  width: 16px;
+  height: 16px;
+}
+.calibration-progress {
+  height: 7px;
+  margin: 20px 0;
+  overflow: hidden;
+  border-radius: 99px;
+  background: var(--color-surface-soft);
+}
+.calibration-progress span {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--color-accent-blue);
+  transform-origin: left center;
+  transition: transform 0.2s ease;
+}
+.calibration-stage {
+  position: relative;
+  display: grid;
+  min-height: min(64vh, 620px);
+  place-items: center;
+  overflow: hidden;
+  border-radius: 16px;
+  background: var(--color-purple-soft);
+}
+.calibration-stage video,
+.calibration-stage img {
+  width: 100%;
+  height: min(64vh, 620px);
+  object-fit: contain;
+}
+.calibration-stage video {
+  transform: scaleX(-1);
+}
+.calibration-controls {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-height: 42px;
+  gap: 16px;
+  margin-top: 18px;
+}
+.calibration-point-status {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: inline-flex;
+  align-items: center;
+  min-height: 38px;
+  width: fit-content;
+  flex-shrink: 0;
+  padding: 7px 10px;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgba(79, 116, 219, 0.22);
+  border-radius: 99px;
+  color: var(--color-muted);
+  background: rgba(255, 255, 255, 0.9);
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+/* 재시도 중임을 색으로도 구분한다 — 문구만 바뀌면 눈에 잘 안 들어온다. */
+.calibration-point-status--retry {
+  border-color: rgba(226, 138, 42, 0.4);
+  color: #b26a16;
+  background: rgba(255, 246, 232, 0.96);
+}
+/**
+ * 시선 보정 점을 뷰포트 전체에 배치하는 층.
+ *
+ * 보정을 뷰포트 좌표계에서 학습해야 보정 화면과 게임 화면의 크기가 달라도 같은 보정값을 쓸 수
+ * 있다. 그래서 점은 다이얼로그 안이 아니라 화면 전체에 찍는다. 다이얼로그(z-index 30)보다 위에
+ * 있어야 보이고, 클릭은 통과시켜 아래의 '다음 지점' 버튼을 계속 누를 수 있게 한다.
+ */
+.gaze-target-overlay {
+  position: fixed;
+  z-index: 40;
+  inset: 0;
+  pointer-events: none;
+}
+/* SeeSo 자체 보정 중에는 화면을 덮어 점에만 집중하게 한다. */
+.gaze-target-overlay--seeso {
+  background: rgba(13, 26, 56, 0.86);
+}
+.gaze-target-overlay__hint {
+  position: absolute;
+  bottom: 12%;
+  left: 50%;
+  margin: 0;
+  color: #fff;
+  font-size: 18px;
+  font-weight: 700;
+  text-align: center;
+  transform: translateX(-50%);
+}
+.calibration-target {
+  position: absolute;
+  z-index: 1;
+  width: 18px;
+  height: 18px;
+  border: 5px solid #fff;
+  border-radius: 50%;
+  background: var(--color-accent-blue);
+  animation: calib-pulse 1.6s ease-in-out infinite;
+  /* left/top은 gazeCalibrationTargetStyle이 0~1 좌표를 %로 변환해 인라인으로 넣어준다. */
+  transform: translate(-50%, -50%);
+}
+/**
+ * SeeSo 자체 보정(1단계) 점 — 9점 보정과 구분되도록 색을 달리한다.
+ * ⚠️ 반드시 `.calibration-target` **뒤에** 와야 한다. 두 규칙의 명시도가 같아서, 앞에 두면
+ * 기본 클래스의 background가 나중에 선언돼 이 색을 덮어쓴다.
+ */
+.calibration-target--seeso {
+  width: 22px;
+  height: 22px;
+  background: #ff7a59;
+  box-shadow: 0 0 0 8px rgba(255, 122, 89, 0.3);
+}
+.calibration-camera-status {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 2;
+  display: flex;
+  width: min(80%, 360px);
+  box-sizing: border-box;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 16px 20px;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgba(79, 116, 219, 0.18);
+  border-radius: 16px;
+  color: var(--color-ink);
+  background: rgba(255, 255, 255, 0.94);
+  text-align: center;
+}
+.calibration-camera-status strong {
+  font-size: 15px;
+}
+.calibration-camera-status span {
+  color: var(--color-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+@keyframes calib-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 6px rgba(79, 116, 219, 0.18);
+  }
+  50% {
+    box-shadow: 0 0 0 12px rgba(79, 116, 219, 0.08);
+  }
+}
+.calibration-live-status {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  max-width: calc(100% - 32px);
+  margin: 0;
+  padding: 9px 14px;
+  transform: translateX(-50%);
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.92);
+  font-size: 13px;
+  font-weight: 800;
+  text-align: center;
+}
+.calibration-live-status .warn {
+  color: #b75555;
+}
+.calibration-live-status .success {
+  color: #278957;
+}
+.calibration-live-status .recording {
+  color: var(--color-accent-blue);
+}
+.calibration-dialog footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+  margin-top: 0;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.calibration-dialog footer button {
+  min-width: 112px;
+}
+.dialog-pop-enter-active,
+.dialog-pop-leave-active {
+  transition: background-color 200ms ease;
+}
+.dialog-pop-enter-active :is(.ready-dialog, .calibration-dialog),
+.dialog-pop-leave-active :is(.ready-dialog, .calibration-dialog) {
+  transition:
+    transform 240ms var(--ease-out),
+    opacity 240ms var(--ease-out);
+}
+.dialog-pop-enter-from,
+.dialog-pop-leave-to {
+  background-color: rgba(13, 26, 56, 0);
+}
+.dialog-pop-enter-from :is(.ready-dialog, .calibration-dialog),
+.dialog-pop-leave-to :is(.ready-dialog, .calibration-dialog) {
+  opacity: 0;
+  transform: scale(0.96) translateY(8px);
+}
+.missing {
+  padding: 60px;
+  text-align: center;
+}
+button:focus-visible,
+.back:focus-visible {
+  outline: 3px solid rgba(79, 116, 219, 0.4);
+  outline-offset: 3px;
+}
+@media (max-width: 720px) {
+  .game-room-page {
+    padding: 18px 0 36px;
+  }
+  .room-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .room-header__actions {
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .room-header__actions {
+    justify-content: space-between;
+  }
+  .participant-grid {
+    grid-template-columns: 1fr;
+  }
+  .my-progress {
+    gap: 6px;
+  }
+  .my-progress li {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto auto;
+    place-items: center;
+    gap: 3px;
+    text-align: center;
+  }
+  .my-progress b {
+    grid-row: auto;
+  }
+  .ready-dialog__actions {
+    grid-template-columns: 1fr;
+  }
+  .calibration-dialog {
+    padding: 20px;
+  }
+  .calibration-stage,
+  .calibration-stage video,
+  .calibration-stage img {
+    min-height: 250px;
+    height: 250px;
+  }
+  .calibration-controls {
+    display: grid;
+    min-height: 0;
+    justify-items: end;
+    gap: 12px;
+  }
+  .calibration-point-status {
+    position: static;
+    justify-self: center;
+    transform: none;
+  }
+  .calibration-dialog footer {
+    width: auto;
+  }
+  .calibration-dialog footer button {
+    flex: initial;
+  }
+}
+</style>

@@ -1,0 +1,58 @@
+package com.eyedontcare.backend.ranking.controller;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import com.eyedontcare.backend.global.common.response.ApiResponse;
+import com.eyedontcare.backend.global.security.AuthenticatedUser;
+import com.eyedontcare.backend.ranking.RankingSuccessCode;
+import com.eyedontcare.backend.ranking.dto.response.GameRankingResponse;
+import com.eyedontcare.backend.ranking.dto.response.RankingListResponse;
+import com.eyedontcare.backend.ranking.service.RankingService;
+
+@RestController
+@RequestMapping("/api/v1/rankings")
+public class RankingController {
+
+	private final RankingService rankingService;
+
+	public RankingController(RankingService rankingService) {
+		this.rankingService = rankingService;
+	}
+
+	// 홈 요약 랭킹은 게스트도 조회할 수 있다. 비로그인(member == null)이면 내 순위는 생략한다.
+	@GetMapping
+	public ResponseEntity<ApiResponse<RankingListResponse>> getRankings(
+		@AuthenticationPrincipal AuthenticatedUser member,
+		@RequestParam(defaultValue = "3") int limit
+	) {
+		Long userId = member != null ? member.userId() : null;
+		RankingListResponse response =
+			rankingService.getRankings(userId, limit);
+
+		return ResponseEntity.ok(ApiResponse.success(
+			RankingSuccessCode.RANKING_LIST_FOUND,
+			response
+		));
+	}
+
+	@GetMapping("/{gameName}")
+	public ResponseEntity<ApiResponse<GameRankingResponse>> getGameRanking(
+		@AuthenticationPrincipal AuthenticatedUser member,
+		@PathVariable String gameName,
+		@RequestParam(defaultValue = "1") int page,
+		@RequestParam(defaultValue = "20") int size
+	) {
+		GameRankingResponse response =
+			rankingService.getGameRanking(member.userId(), gameName, page, size);
+
+		return ResponseEntity.ok(ApiResponse.success(
+			RankingSuccessCode.GAME_RANKING_FOUND,
+			response
+		));
+	}
+}

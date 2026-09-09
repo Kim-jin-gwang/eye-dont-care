@@ -1,0 +1,63 @@
+# Render Blueprint — 실제 백엔드를 무료 티어로 올릴 때의 참고 구성 (docs/DEMO.md "실제 스택으로 배포하려면").
+# PostgreSQL은 Neon 등 외부 DB를 쓰고, Redis는 Render Key Value를 붙인다.
+# 비밀값(sync: false)은 Render 대시보드에서 직접 입력한다.
+services:
+  - type: web
+    name: eye-dont-care-backend
+    runtime: docker
+    plan: free
+    region: singapore
+    rootDir: backend
+    dockerfilePath: ./Dockerfile.prod
+    healthCheckPath: /api/v1/ping
+    envVars:
+      - key: SPRING_PROFILES_ACTIVE
+        value: prod
+      - key: SERVER_PORT
+        value: "8080"
+      - key: SERVER_FORWARD_HEADERS_STRATEGY
+        value: native
+      - key: JAVA_TOOL_OPTIONS
+        value: -Xmx256m -XX:+UseSerialGC
+      - key: SPRING_DATASOURCE_URL
+        sync: false # 예: jdbc:postgresql://<neon-host>/<db>?sslmode=require
+      - key: SPRING_DATASOURCE_USERNAME
+        sync: false
+      - key: SPRING_DATASOURCE_PASSWORD
+        sync: false
+      - key: SPRING_DATA_REDIS_HOST
+        fromService:
+          type: keyvalue
+          name: eye-dont-care-redis
+          property: host
+      - key: SPRING_DATA_REDIS_PORT
+        fromService:
+          type: keyvalue
+          name: eye-dont-care-redis
+          property: port
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: APP_CORS_ALLOWED_ORIGINS
+        sync: false # 프론트 도메인, 예: https://eye-dont-care.pages.dev
+      # 카카오 로그인·미디어 서버는 키가 없으면 해당 기능만 비활성. application-prod.yml이 요구하는 키는 빈 값이라도 채운다.
+      - key: KAKAO_CLIENT_ID
+        sync: false
+      - key: KAKAO_CLIENT_SECRET
+        sync: false
+      - key: KAKAO_REDIRECT_URI
+        sync: false
+      - key: OPENVIDU_URL
+        value: wss://localhost:7443
+      - key: LIVEKIT_API_KEY
+        value: devkey
+      - key: LIVEKIT_API_SECRET
+        value: secret
+      - key: VISION_API_KEY
+        sync: false
+
+  - type: keyvalue
+    name: eye-dont-care-redis
+    plan: free
+    region: singapore
+    maxmemoryPolicy: allkeys-lru
+    ipAllowList: [] # 같은 Render 계정의 서비스만 접근

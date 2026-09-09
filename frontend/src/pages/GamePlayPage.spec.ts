@@ -1,0 +1,1388 @@
+import { nextTick, ref } from 'vue'
+import { flushPromises, mount } from '@vue/test-utils'
+import { createMemoryHistory, createRouter } from 'vue-router'
+import { createPinia } from 'pinia'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import GamePlayPage from './GamePlayPage.vue'
+import GameResultPage from './GameResultPage.vue'
+import { recognizeDrawing } from '../api/draw'
+import { useLastGameResultStore } from '../stores/lastGameResult'
+import type { LastGameOutcome } from '../stores/lastGameResult'
+import type { GameDetailId } from '../types/game-detail'
+import type { GameSessionMode } from '../types/gameplay'
+import {
+  issuePlayEntry,
+  SOLO_PLAY_ENTRY_KEY,
+  type PlayEntryMode,
+} from '../utils/soloPlayEntry'
+
+const GUEST_STORAGE_KEY = 'eye-dont-care.guestSessionId'
+const submitPlayedResultMock = vi.hoisted(() => vi.fn().mockResolvedValue(null))
+
+// 그림그리기 AI 채점은 아직 없는 백엔드 엔드포인트를 호출한다 — 테스트에선 실제 네트워크 대신
+// 이 함수를 목업해서 성공/실패 응답을 원하는 대로 만들어낸다.
+vi.mock('../api/draw', () => ({
+  recognizeDrawing: vi.fn(),
+}))
+
+vi.mock('../composables/useGameResultSubmission', () => ({
+  useGameResultSubmission: () => ({
+    submitPlayedResult: submitPlayedResultMock,
+  }),
+}))
+
+// 테스트 환경(jsdom)에는 실제 카메라/MediaPipe가 없어 useEyeTracking().start()가 항상 실패한다.
+// GamePlayPage는 카메라 시작이 성공해야 그 다음(대결 상대와의 게임 세션 소켓 연결 등)으로 진행하므로,
+// 카메라·시선 인식 부분만 성공한 것처럼 목업 처리한다 — 이 파일이 마운트하는 모든 게임(blink/hold/
+// rhythm)이 각자 자기 인스턴스를 만들지만, 어차피 값 자체는 안 쓰고 "성공 여부"만 필요하다.
+//
+// eyeTrackingMockInstances: 생성된 순서대로 인스턴스를 담아 둔다 — GamePlayPage.vue는
+// drawTracking을 제일 먼저 선언하므로(다른 4개 게임보다 앞), 그림그리기 테스트에서 실제로
+// "시선으로 그리는" 상황을 흉내낼 때 `eyeTrackingMockInstances[0]`으로 그 인스턴스를 찾아
+// screenGaze/combinedState를 직접 조작한다.
+const eyeTrackingMockInstances: Array<{
+  screenGaze: ReturnType<typeof ref<{ x: number; y: number } | null>>
+  combinedState: ReturnType<typeof ref<string>>
+  faceDetected: ReturnType<typeof ref<boolean>>
+  stop: ReturnType<typeof vi.fn>
+}> = []
+
+/**
+ * SeeSo는 실제 SDK·카메라·라이선스 서버가 필요해 테스트 환경에서는 동작할 수 없다. 모킹하지
+ * 않으면 개발자 `.env`에 라이선스 키가 있는지에 따라 테스트 결과가 달라진다(키가 있으면 초기화를
+ * 시도하다 실패). 여기서는 항상 "설정되지 않음"으로 고정해 MediaPipe 경로만 검증한다.
+ */
+vi.mock('../composables/useSeeSoGaze', () => ({
+  SEESO_MARGIN_BEFORE_CALIBRATION: 0.15,
+  SEESO_MARGIN_AFTER_CALIBRATION: 0.45,
+  useSeeSoGaze: () => ({
+    isConfigured: false,
+    isRunning: ref(false),
+    isStarting: ref(false),
+    error: ref(null),
+    viewportGaze: ref(null),
+    setMargin: vi.fn(),
+    start: vi.fn(async () => false),
+    stop: vi.fn(),
+    calibrate: vi.fn(async () => false),
+  }),
+}))
+
+vi.mock('../composables/useEyeTracking', () => ({
+  useEyeTracking: () => {
+    const instance = {
+      videoRef: ref(null),
+      stream: ref(null),
+      isActive: ref(true),
+      isLoadingModel: ref(false),
+      modelError: ref(null),
+      faceDetected: ref(false),
+      leftEyeState: ref('NOT_DETECTED'),
+      rightEyeState: ref('NOT_DETECTED'),
+      combinedState: ref('UNKNOWN'),
+      leftRatio: ref(0),
+      rightRatio: ref(0),
+      confidence: ref(0),
+      fps: ref(0),
+      rawGaze: ref(null),
+      screenGaze: ref<{ x: number; y: number } | null>(null),
+      lastEvent: ref(null),
+      eventSequence: ref(0),
+      onEyeEvent: () => () => {},
+      start: async () => true,
+      stop: vi.fn(),
+      recordEyeSample: async () => ({ success: true, sampleCount: 10 }),
+      resetEyeBaseline: () => {},
+      applyEyeProfile: () => {},
+      eyeProfile: ref({}),
+      beginGazeCalibration: () => {},
+      addGazeCalibrationSample: () => true,
+      finishGazeCalibration: () => null,
+      applyGazeProfile: () => {},
+      gazeCalibrationTargets: [],
+    }
+    eyeTrackingMockInstances.push(instance)
+    return instance
+  },
+}))
+
+/**
+ * 그림그리기 테스트용: 실제로 시선을 움직여 그림을 그린 것처럼 만든다. 서로 다른 두 좌표를
+ * 순서대로 넣고 실제 애니메이션 프레임이 몇 번 지나가길 기다려서, addPointToStroke가 최소
+ * 두 점을 가진 스트로크를 만들게 한다(제출 시 "빈 캔버스" 안전장치를 통과하기 위함).
+ *
+ * 반드시 마운트 + `flushPromises()`(initDrawGame 완료) 이후에 호출해야 한다 — 그래야
+ * `eyeTrackingMockInstances[0]`(drawTracking, GamePlayPage.vue에서 제일 먼저 선언됨)이
+ * 이미 채워져 있다.
+ */
+/**
+ * jsdom에는 레이아웃 엔진이 없어 모든 엘리먼트의 `getBoundingClientRect()`가 0을 반환한다.
+ * 실제 코드는 보정된 시선(뷰포트 기준 0~1)을 캔버스 기준 좌표로 옮기므로, 캔버스가 화면 어디에
+ * 얼마나 크게 있는지 알 수 없으면 좌표가 전부 밖으로 계산돼 선이 하나도 그려지지 않는다.
+ * 뷰포트(jsdom 기본 1024x768) 안쪽에 놓인 캔버스를 흉내 낸다. 캔버스가 언제 렌더되든 적용되도록
+ * prototype에 걸어 둔다.
+ */
+globalThis.HTMLCanvasElement.prototype.getBoundingClientRect = () =>
+  ({
+    x: 100,
+    y: 100,
+    left: 100,
+    top: 100,
+    width: 800,
+    height: 500,
+    right: 900,
+    bottom: 600,
+    toJSON: () => ({}),
+  }) as globalThis.DOMRect
+
+async function simulateDrawingSomething() {
+  const draw = eyeTrackingMockInstances[0]
+  draw.faceDetected.value = true
+  draw.combinedState.value = 'BOTH_OPEN'
+  // 위에서 흉내 낸 캔버스 사각형 안쪽에 들어오는 뷰포트 좌표를 준다.
+  draw.screenGaze.value = { x: 0.35, y: 0.35 }
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 40))
+  draw.screenGaze.value = { x: 0.6, y: 0.55 }
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 100))
+}
+
+/** useWaitingRoomSocket.spec.ts / useGameSessionSocket이 쓰는 것과 동일한 WebSocket mock. */
+class MockWebSocket {
+  static readonly CONNECTING = 0
+  static readonly OPEN = 1
+  static readonly CLOSING = 2
+  static readonly CLOSED = 3
+  static instances: MockWebSocket[] = []
+
+  readyState = MockWebSocket.CONNECTING
+  sent: string[] = []
+  onopen: (() => void) | null = null
+  onmessage: ((event: { data: string }) => void) | null = null
+  onerror: (() => void) | null = null
+  onclose: (() => void) | null = null
+
+  url: string
+
+  constructor(url: string) {
+    this.url = url
+    MockWebSocket.instances.push(this)
+  }
+
+  send(data: string): void {
+    this.sent.push(data)
+  }
+
+  close(): void {
+    this.readyState = MockWebSocket.CLOSED
+    this.onclose?.()
+  }
+
+  simulateOpen(): void {
+    this.readyState = MockWebSocket.OPEN
+    this.onopen?.()
+  }
+
+  simulateMessage(payload: unknown): void {
+    this.onmessage?.({ data: JSON.stringify(payload) })
+  }
+}
+
+function createGameRouter() {
+  return createRouter({
+    history: createMemoryHistory(),
+    routes: [
+      {
+        path: '/games/:gameId/play',
+        name: 'game-play',
+        component: GamePlayPage,
+      },
+      {
+        path: '/games/:gameId/result',
+        name: 'game-result',
+        component: GameResultPage,
+      },
+      {
+        path: '/games/:gameId',
+        name: 'game-detail',
+        component: { template: '<div>game detail</div>' },
+      },
+    ],
+  })
+}
+
+function issueGuestPlayEntry(gameId: string, mode: PlayEntryMode): void {
+  globalThis.sessionStorage.setItem(GUEST_STORAGE_KEY, 'guest-1')
+  expect(issuePlayEntry(gameId, mode)).toBe(true)
+}
+
+function issueGuestSoloEntry(gameId: string): void {
+  issueGuestPlayEntry(gameId, 'solo')
+}
+
+function stubDocumentHidden(initialValue: boolean) {
+  let hidden = initialValue
+  vi.spyOn(globalThis.document, 'hidden', 'get').mockImplementation(
+    () => hidden,
+  )
+  return (nextValue: boolean) => {
+    hidden = nextValue
+  }
+}
+
+async function mountStarePlay(mode: GameSessionMode, replay = false) {
+  eyeTrackingMockInstances.length = 0
+  if (mode === 'solo' || mode === 'ai') {
+    issueGuestPlayEntry('hold', mode)
+  } else {
+    globalThis.sessionStorage.setItem(GUEST_STORAGE_KEY, 'guest-1')
+    vi.stubGlobal('WebSocket', MockWebSocket)
+    MockWebSocket.instances = []
+  }
+
+  const router = createGameRouter()
+  const replayQuery = replay ? '&replay=1' : ''
+  await router.push(
+    `/games/hold/play?mode=${mode}&roomId=room-1${replayQuery}`,
+  )
+  await router.isReady()
+  const pinia = createPinia()
+  const wrapper = mount(GamePlayPage, {
+    global: { plugins: [router, pinia] },
+  })
+  await flushPromises()
+  await nextTick()
+
+  return { pinia, router, wrapper }
+}
+
+function createResultPinia(
+  gameId: GameDetailId,
+  drawRounds = false,
+  isNewRecord = drawRounds,
+  mode: GameSessionMode = 'solo',
+) {
+  const pinia = createPinia()
+  const store = useLastGameResultStore(pinia)
+  store.set({
+    gameId,
+    mode,
+    outcome: 'COMPLETED',
+    isNewRecord,
+    headline: '게임이 종료되었습니다!',
+    summary: drawRounds
+      ? '3개 라운드의 그림 인식 결과를 확인해보세요.'
+      : '플레이 결과를 확인해보세요.',
+    scoreLabel: '최종 점수',
+    score: drawRounds ? '680점' : '120점',
+    stats: [],
+    ...(drawRounds
+      ? {
+          drawRounds: [
+            {
+              round: 1,
+              difficulty: 'EASY',
+              prompt: '안경',
+              aiGuess: '안경',
+              confidence: 0.8,
+              answer: '',
+              aiCorrect: true,
+              answerCorrect: false,
+              success: true,
+              baseScore: 100,
+              timeBonus: 40,
+              confidenceBonus: 40,
+              score: 180,
+              reason: '테스트 결과',
+            },
+            {
+              round: 2,
+              difficulty: 'MEDIUM',
+              prompt: '우산',
+              aiGuess: '우산',
+              confidence: 0.9,
+              answer: '',
+              aiCorrect: true,
+              answerCorrect: false,
+              success: true,
+              baseScore: 150,
+              timeBonus: 50,
+              confidenceBonus: 80,
+              score: 230,
+              reason: '테스트 결과',
+            },
+            {
+              round: 3,
+              difficulty: 'HARD',
+              prompt: '강아지',
+              aiGuess: '강아지',
+              confidence: 1,
+              answer: '',
+              aiCorrect: true,
+              answerCorrect: false,
+              success: true,
+              baseScore: 200,
+              timeBonus: 60,
+              confidenceBonus: 110,
+              score: 270,
+              reason: '테스트 결과',
+            },
+          ],
+        }
+      : {}),
+  })
+  return pinia
+}
+
+function createDrawResultPinia(
+  gameId: GameDetailId,
+  mode: 'ai' | 'friends' | 'random' = 'random',
+) {
+  const pinia = createPinia()
+  const store = useLastGameResultStore(pinia)
+  store.set({
+    gameId,
+    mode,
+    outcome: 'DRAW',
+    opponentNickname: '상대 플레이어',
+    headline: 'DRAW',
+    summary: '마지막까지 팽팽한 승부였어요!',
+    scoreLabel: '최종 점수',
+    score: gameId === 'air' ? '3' : '1,860점',
+    opponentScore: gameId === 'air' ? '3' : '1,860점',
+    stats: [
+      {
+        label: '최대 콤보',
+        value: '20',
+        opponentValue: '20',
+      },
+    ],
+  })
+  return pinia
+}
+
+function createCompetitiveResultPinia(
+  gameId: GameDetailId,
+  outcome: LastGameOutcome,
+  mode: 'friends' | 'random' = 'friends',
+) {
+  const pinia = createPinia()
+  const store = useLastGameResultStore(pinia)
+  store.set({
+    gameId,
+    mode,
+    outcome,
+    opponentNickname: '상대 플레이어',
+    headline: outcome === 'LOSE' ? '아쉽게 졌어요' : '승리했어요!',
+    summary: '대결 결과를 확인해 보세요.',
+    scoreLabel: '최종 점수',
+    score: gameId === 'blink' ? '3' : '1,860점',
+    opponentScore: gameId === 'blink' ? '5' : '1,240점',
+    stats:
+      gameId === 'blink'
+        ? []
+        : [
+            {
+              label: '최대 콤보',
+              value: '24',
+            },
+          ],
+  })
+  return pinia
+}
+
+describe('gameplay routes', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+    vi.mocked(recognizeDrawing).mockReset()
+    submitPlayedResultMock.mockReset().mockResolvedValue(null)
+    eyeTrackingMockInstances.length = 0
+    globalThis.sessionStorage.clear()
+  })
+
+  it.each(['air', 'hold', 'draw', 'rhythm', 'blink'])(
+    'renders the %s play route from mock data',
+    async (gameId) => {
+      issueGuestSoloEntry(gameId)
+      const router = createGameRouter()
+      await router.push(`/games/${gameId}/play?mode=solo`)
+      await router.isReady()
+      const wrapper = mount(GamePlayPage, {
+        global: { plugins: [router, createPinia()] },
+      })
+      expect(wrapper.find('.play-shell').exists()).toBe(true)
+      expect(wrapper.find('button.finish').exists()).toBe(false)
+      expect(globalThis.sessionStorage.getItem(SOLO_PLAY_ENTRY_KEY)).toBeNull()
+      wrapper.unmount()
+    },
+  )
+
+  it('shows a countdown before starting a replay', async () => {
+    vi.useFakeTimers()
+
+    issueGuestSoloEntry('blink')
+    const router = createGameRouter()
+    await router.push('/games/blink/play?mode=solo&replay=1')
+    await router.isReady()
+    const wrapper = mount(GamePlayPage, {
+      global: { plugins: [router, createPinia()] },
+    })
+    await nextTick()
+
+    const getCountdown = () =>
+      document.body.querySelector('[aria-label="게임 다시 시작 카운트다운"]')
+
+    expect(getCountdown()).not.toBeNull()
+    expect(getCountdown()?.textContent).toContain('3')
+
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(getCountdown()?.textContent).toContain('2')
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(getCountdown()?.textContent).toContain('1')
+    await vi.advanceTimersByTimeAsync(1000)
+    await flushPromises()
+    await nextTick()
+
+    expect(getCountdown()).toBeNull()
+    expect(router.currentRoute.value.query.replay).toBeUndefined()
+
+    wrapper.unmount()
+    vi.useRealTimers()
+  })
+
+  describe('EYEFIGHT visibility exit', () => {
+    it('does not exit while the replay countdown is still ready', async () => {
+      vi.useFakeTimers()
+      stubDocumentHidden(true)
+
+      const { router, wrapper } = await mountStarePlay('solo', true)
+      globalThis.document.dispatchEvent(new Event('visibilitychange'))
+      await nextTick()
+
+      expect(router.currentRoute.value.name).toBe('game-play')
+      expect(eyeTrackingMockInstances[2].stop).not.toHaveBeenCalled()
+      expect(submitPlayedResultMock).not.toHaveBeenCalled()
+      wrapper.unmount()
+    })
+
+    it('exits immediately when the round starts while the page is already hidden', async () => {
+      vi.useFakeTimers()
+      stubDocumentHidden(true)
+
+      const { pinia, router, wrapper } = await mountStarePlay('solo', true)
+      await vi.advanceTimersByTimeAsync(3000)
+      await flushPromises()
+      await nextTick()
+
+      expect(router.currentRoute.value.name).toBe('game-detail')
+      expect(useLastGameResultStore(pinia).current).toBeNull()
+      expect(submitPlayedResultMock).not.toHaveBeenCalled()
+      expect(eyeTrackingMockInstances[2].stop).toHaveBeenCalled()
+      wrapper.unmount()
+    })
+
+    it.each(['solo', 'ai'] as const)(
+      'exits an active %s game without saving a result',
+      async (mode) => {
+        const setHidden = stubDocumentHidden(false)
+        const { pinia, router, wrapper } = await mountStarePlay(mode)
+        const pushSpy = vi.spyOn(router, 'push')
+
+        setHidden(true)
+        globalThis.document.dispatchEvent(new Event('visibilitychange'))
+        globalThis.document.dispatchEvent(new Event('visibilitychange'))
+        await flushPromises()
+
+        expect(router.currentRoute.value.name).toBe('game-detail')
+        expect(pushSpy).toHaveBeenCalledTimes(1)
+        expect(useLastGameResultStore(pinia).current).toBeNull()
+        expect(submitPlayedResultMock).not.toHaveBeenCalled()
+        expect(eyeTrackingMockInstances[2].stop).toHaveBeenCalled()
+        wrapper.unmount()
+      },
+    )
+
+    it('keeps an active EYEFIGHT game running while the page is visible', async () => {
+      stubDocumentHidden(false)
+      const { router, wrapper } = await mountStarePlay('solo')
+
+      globalThis.document.dispatchEvent(new Event('visibilitychange'))
+      await nextTick()
+
+      expect(router.currentRoute.value.name).toBe('game-play')
+      expect(submitPlayedResultMock).not.toHaveBeenCalled()
+      wrapper.unmount()
+    })
+
+    it('does not exit after the EYEFIGHT round has finished', async () => {
+      vi.useFakeTimers()
+      const setHidden = stubDocumentHidden(false)
+      const { router, wrapper } = await mountStarePlay('solo')
+      // setupState는 Vue 내부 필드라 public 타입인 ComponentInternalInstance에 없다.
+      // 인스턴스를 먼저 단언해야 프로퍼티 접근 자체가 타입 오류가 되지 않는다.
+      const { setupState } = wrapper.vm.$ as unknown as {
+        setupState: { stareGameState: { phase: string } }
+      }
+      setupState.stareGameState.phase = 'finished'
+
+      setHidden(true)
+      globalThis.document.dispatchEvent(new Event('visibilitychange'))
+      await nextTick()
+
+      expect(router.currentRoute.value.name).toBe('game-play')
+      expect(submitPlayedResultMock).not.toHaveBeenCalled()
+      wrapper.unmount()
+    })
+
+    it.each(['friends', 'random'] as const)(
+      'closes the %s game session once without sending GAME_OVER',
+      async (mode) => {
+        const setHidden = stubDocumentHidden(false)
+        const { pinia, router, wrapper } = await mountStarePlay(mode)
+        const ws = MockWebSocket.instances[0]
+        expect(ws).toBeTruthy()
+        ws.simulateOpen()
+        const closeSpy = vi.spyOn(ws, 'close')
+
+        setHidden(true)
+        globalThis.document.dispatchEvent(new Event('visibilitychange'))
+        globalThis.document.dispatchEvent(new Event('visibilitychange'))
+        await flushPromises()
+
+        expect(router.currentRoute.value.name).toBe('game-detail')
+        expect(closeSpy).toHaveBeenCalledTimes(1)
+        expect(
+          ws.sent.some((message) => {
+            const event = JSON.parse(message) as { eventType?: string }
+            return event.eventType === 'GAME_OVER'
+          }),
+        ).toBe(false)
+        expect(useLastGameResultStore(pinia).current).toBeNull()
+        expect(submitPlayedResultMock).not.toHaveBeenCalled()
+        wrapper.unmount()
+      },
+    )
+
+    it('ignores visibility changes for other games', async () => {
+      const setHidden = stubDocumentHidden(false)
+      issueGuestSoloEntry('blink')
+      const router = createGameRouter()
+      await router.push('/games/blink/play?mode=solo')
+      await router.isReady()
+      const wrapper = mount(GamePlayPage, {
+        global: { plugins: [router, createPinia()] },
+      })
+      await flushPromises()
+
+      setHidden(true)
+      globalThis.document.dispatchEvent(new Event('visibilitychange'))
+      await nextTick()
+
+      expect(router.currentRoute.value.name).toBe('game-play')
+      wrapper.unmount()
+    })
+
+    it('removes the visibility listener with the registered reference', async () => {
+      stubDocumentHidden(false)
+      const addEventListenerSpy = vi.spyOn(
+        globalThis.document,
+        'addEventListener',
+      )
+      const removeEventListenerSpy = vi.spyOn(
+        globalThis.document,
+        'removeEventListener',
+      )
+      const { wrapper } = await mountStarePlay('solo')
+      const visibilityCall = addEventListenerSpy.mock.calls.find(
+        ([type]) => type === 'visibilitychange',
+      )
+
+      expect(visibilityCall).toBeTruthy()
+      wrapper.unmount()
+      expect(removeEventListenerSpy).toHaveBeenCalledWith(
+        'visibilitychange',
+        visibilityCall?.[1],
+      )
+    })
+  })
+
+  it('shows the round score dialog and advances to the next round after AI judging succeeds', async () => {
+    eyeTrackingMockInstances.length = 0
+    vi.mocked(recognizeDrawing).mockResolvedValue({
+      label: '하트',
+      confidence: 0.8,
+      isTarget: true,
+      reason: 'AI가 하트 모양을 인식했어요.',
+      candidates: [],
+    })
+
+    issueGuestPlayEntry('draw', 'ai')
+    const router = createGameRouter()
+    await router.push('/games/draw/play?mode=ai')
+    await router.isReady()
+    const wrapper = mount(GamePlayPage, {
+      attachTo: document.body,
+      global: { plugins: [router, createPinia()] },
+    })
+    expect(globalThis.sessionStorage.getItem(SOLO_PLAY_ENTRY_KEY)).toBeNull()
+    await flushPromises() // initDrawGame()의 카메라 시작 등 비동기 초기화 완료 대기
+    await simulateDrawingSomething() // 빈 캔버스 안전장치를 통과할 만큼 실제로 그림을 그려 둔다
+
+    await wrapper.get('.draw-tools .primary').trigger('click')
+    await flushPromises()
+
+    expect(document.body.textContent).toContain('ROUND 1 점수')
+    expect(document.body.textContent).toContain('정답입니다!')
+
+    const nextButton =
+      document.body.querySelector<HTMLButtonElement>('.dialog-action')
+    await nextButton?.click()
+    await nextTick()
+    expect(wrapper.text()).toContain('Round 2')
+    wrapper.unmount()
+  })
+
+  it('shows a retryable error(대신 성공으로 조용히 넘어가지 않음) when AI judging fails', async () => {
+    eyeTrackingMockInstances.length = 0
+    vi.mocked(recognizeDrawing).mockRejectedValue(
+      new Error('AI 채점 서버에 연결하지 못했어요.'),
+    )
+
+    issueGuestPlayEntry('draw', 'ai')
+    const router = createGameRouter()
+    await router.push('/games/draw/play?mode=ai')
+    await router.isReady()
+    const wrapper = mount(GamePlayPage, {
+      global: { plugins: [router, createPinia()] },
+    })
+    await flushPromises() // initDrawGame()의 카메라 시작 등 비동기 초기화 완료 대기
+    await simulateDrawingSomething() // 빈 캔버스 안전장치를 통과할 만큼 실제로 그림을 그려 둔다
+
+    await wrapper.get('.draw-tools .primary').trigger('click')
+    await flushPromises()
+
+    // 실패했을 때 점수 다이얼로그가 뜨면 안 되고(가짜 성공으로 넘어가지 않음), 라운드는 계속
+    // 진행 중 상태로 남아 다시 제출을 시도할 수 있어야 한다.
+    expect(wrapper.find('.score-backdrop').exists()).toBe(false)
+    expect(wrapper.text()).toContain('AI 채점 서버에 연결하지 못했어요.')
+    expect(
+      wrapper.get<HTMLButtonElement>('.draw-tools .primary').element.disabled,
+    ).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('rejects an empty canvas submission as wrong without calling the AI', async () => {
+    eyeTrackingMockInstances.length = 0
+    issueGuestPlayEntry('draw', 'ai')
+    const router = createGameRouter()
+    await router.push('/games/draw/play?mode=ai')
+    await router.isReady()
+    const wrapper = mount(GamePlayPage, {
+      attachTo: document.body,
+      global: { plugins: [router, createPinia()] },
+    })
+    await flushPromises()
+
+    // 시선을 전혀 움직이지 않은 채(즉 아무것도 그리지 않은 채) 곧바로 제출한다.
+    await wrapper.get('.draw-tools .primary').trigger('click')
+    await flushPromises()
+
+    expect(recognizeDrawing).not.toHaveBeenCalled()
+    // 결과 다이얼로그는 Teleport로 document.body에 렌더링되므로 wrapper.text()로는 못 잡는다.
+    expect(document.body.textContent).toContain('그림을 그리지 않고 제출했어요')
+    wrapper.unmount()
+  })
+
+  it('shows a leave confirmation dialog before emitting leave', async () => {
+    issueGuestSoloEntry('air')
+    const router = createGameRouter()
+    await router.push('/games/air/play?mode=solo')
+    await router.isReady()
+    const wrapper = mount(GamePlayPage, {
+      global: { plugins: [router, createPinia()] },
+    })
+
+    await wrapper.get('.play-shell__leave').trigger('click')
+    expect(wrapper.find('.play-shell__confirm').exists()).toBe(true)
+    expect(wrapper.text()).toContain('게임에서 나가시겠어요?')
+    expect(wrapper.text()).toContain('몰수패')
+
+    const continueButton = wrapper
+      .findAll('.play-shell__confirm-actions button')
+      .find((button) => button.text() === '계속하기')
+    await continueButton?.trigger('click')
+
+    expect(wrapper.find('.play-shell__confirm').exists()).toBe(false)
+    expect(wrapper.find('.play-shell').exists()).toBe(true)
+    expect(router.currentRoute.value.name).toBe('game-play')
+    wrapper.unmount()
+  })
+
+  it.each(['friends', 'random'])(
+    'renders separate rhythm game status panels in %s mode',
+    async (mode) => {
+      const router = createGameRouter()
+      await router.push(`/games/rhythm/play?mode=${mode}`)
+      await router.isReady()
+      const wrapper = mount(GamePlayPage, {
+        global: { plugins: [router, createPinia()] },
+      })
+
+      expect(wrapper.findAll('.rhythm-duel-player')).toHaveLength(2)
+      expect(wrapper.text()).toContain('상대 게임 화면')
+      expect(wrapper.text()).toContain('체력')
+      wrapper.unmount()
+    },
+  )
+
+  it.each(['friends', 'random'])(
+    'moves to the result screen and stores the opponent score in %s mode',
+    async (mode) => {
+      globalThis.sessionStorage.setItem(GUEST_STORAGE_KEY, 'guest-1')
+      vi.stubGlobal('WebSocket', MockWebSocket)
+      MockWebSocket.instances = []
+
+      const router = createGameRouter()
+      await router.push(`/games/rhythm/play?mode=${mode}&roomId=room-1`)
+      await router.isReady()
+      const pinia = createPinia()
+      const wrapper = mount(GamePlayPage, {
+        global: { plugins: [router, pinia] },
+      })
+      await nextTick()
+
+      const ws = MockWebSocket.instances[0]
+      expect(ws).toBeTruthy()
+      ws.simulateOpen()
+      ws.simulateMessage({
+        type: 'SESSION_STATE',
+        data: {
+          roomId: 'room-1',
+          gameName: 'RHYTHM',
+          participants: [
+            {
+              participantKey: 'GUEST:guest-1',
+              displayName: '내 게스트',
+              roomRole: 'HOST',
+              slotNo: 1,
+              isReady: true,
+              calibrationStatus: 'COMPLETED',
+              joinedAt: new Date().toISOString(),
+            },
+            {
+              participantKey: 'GUEST:opponent',
+              displayName: '상대 게스트',
+              roomRole: 'PLAYER',
+              slotNo: 2,
+              isReady: true,
+              calibrationStatus: 'COMPLETED',
+              joinedAt: new Date().toISOString(),
+            },
+          ],
+        },
+      })
+      ws.simulateMessage({
+        type: 'PLAYER_EVENT',
+        data: {
+          participantKey: 'GUEST:opponent',
+          eventType: 'RHYTHM_STATE',
+          payload: { score: 340, combo: 0, health: 0 },
+          occurredAt: new Date().toISOString(),
+        },
+      })
+
+      await nextTick()
+      await new Promise((resolve) => globalThis.setTimeout(resolve, 0))
+      expect(router.currentRoute.value.name).toBe('game-result')
+      expect(useLastGameResultStore(pinia).current?.opponentNickname).toBe(
+        '게스트 플레이어',
+      )
+      expect(useLastGameResultStore(pinia).current?.opponentScore).toBe('340점')
+
+      wrapper.unmount()
+      vi.unstubAllGlobals()
+      globalThis.sessionStorage.clear()
+    },
+  )
+
+  it('shows a registered opponent nickname in the result store', async () => {
+    globalThis.sessionStorage.setItem(GUEST_STORAGE_KEY, 'guest-1')
+    vi.stubGlobal('WebSocket', MockWebSocket)
+    MockWebSocket.instances = []
+
+    const router = createGameRouter()
+    await router.push('/games/rhythm/play?mode=friends&roomId=room-1')
+    await router.isReady()
+    const pinia = createPinia()
+    const wrapper = mount(GamePlayPage, {
+      global: { plugins: [router, pinia] },
+    })
+    await nextTick()
+
+    const ws = MockWebSocket.instances[0]
+    expect(ws).toBeTruthy()
+    ws.simulateOpen()
+    ws.simulateMessage({
+      type: 'SESSION_STATE',
+      data: {
+        roomId: 'room-1',
+        gameName: 'RHYTHM',
+        participants: [
+          {
+            participantKey: 'GUEST:guest-1',
+            displayName: '게스트 플레이어',
+            roomRole: 'HOST',
+            slotNo: 1,
+            isReady: true,
+            calibrationStatus: 'COMPLETED',
+            joinedAt: new Date().toISOString(),
+          },
+          {
+            participantKey: 'USER:42',
+            displayName: '회원 닉네임',
+            roomRole: 'PLAYER',
+            slotNo: 2,
+            isReady: true,
+            calibrationStatus: 'COMPLETED',
+            joinedAt: new Date().toISOString(),
+          },
+        ],
+      },
+    })
+    ws.simulateMessage({
+      type: 'PLAYER_EVENT',
+      data: {
+        participantKey: 'USER:42',
+        eventType: 'RHYTHM_STATE',
+        payload: { score: 340, combo: 0, health: 0 },
+        occurredAt: new Date().toISOString(),
+      },
+    })
+
+    await nextTick()
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 0))
+    expect(router.currentRoute.value.name).toBe('game-result')
+    expect(useLastGameResultStore(pinia).current?.opponentNickname).toBe(
+      '회원 닉네임',
+    )
+
+    wrapper.unmount()
+    vi.unstubAllGlobals()
+    globalThis.sessionStorage.clear()
+  })
+
+  it.each(['air', 'hold', 'draw', 'rhythm', 'blink'])(
+    'renders the %s result route from a real result',
+    async (gameId) => {
+      const router = createGameRouter()
+      await router.push(`/games/${gameId}/result?mode=solo`)
+      await router.isReady()
+      const pinia = createResultPinia(gameId as GameDetailId, gameId === 'draw')
+      const wrapper = mount(GameResultPage, {
+        global: { plugins: [router, pinia] },
+      })
+      expect(wrapper.find('.result-shell').exists()).toBe(true)
+      wrapper.unmount()
+    },
+  )
+
+  it('passes a replay flag when starting again from the result screen', async () => {
+    globalThis.sessionStorage.setItem(GUEST_STORAGE_KEY, 'guest-1')
+    const router = createGameRouter()
+    await router.push('/games/blink/result?mode=solo&result=completed')
+    await router.isReady()
+    const wrapper = mount(GameResultPage, {
+      global: { plugins: [router, createResultPinia('blink')] },
+    })
+    await flushPromises()
+    await nextTick()
+
+    const replayButton = wrapper
+      .findAll('button')
+      .find((button) => button.text() === '다시 플레이')
+    expect(replayButton).toBeTruthy()
+    await replayButton?.trigger('click')
+    await flushPromises()
+    await nextTick()
+
+    expect(router.currentRoute.value.name).toBe('game-play')
+    expect(router.currentRoute.value.query.replay).toBe('1')
+    expect(router.currentRoute.value.query.result).toBeUndefined()
+    expect(
+      JSON.parse(globalThis.sessionStorage.getItem(SOLO_PLAY_ENTRY_KEY) ?? ''),
+    ).toMatchObject({ gameId: 'blink', mode: 'solo' })
+    wrapper.unmount()
+  })
+
+  it('issues an AI ticket immediately before replay navigation', async () => {
+    globalThis.sessionStorage.setItem(GUEST_STORAGE_KEY, 'guest-1')
+    const router = createGameRouter()
+    await router.push(
+      '/games/blink/result?mode=ai&difficulty=hard&result=completed',
+    )
+    await router.isReady()
+    const wrapper = mount(GameResultPage, {
+      global: {
+        plugins: [router, createResultPinia('blink', false, false, 'ai')],
+      },
+    })
+    await flushPromises()
+    await nextTick()
+
+    const replayButton = wrapper
+      .findAll('button')
+      .find((button) => button.text().includes('다시'))
+    expect(replayButton).toBeTruthy()
+    await replayButton?.trigger('click')
+    await flushPromises()
+
+    expect(router.currentRoute.value.name).toBe('game-play')
+    expect(router.currentRoute.value.query).toMatchObject({
+      mode: 'ai',
+      difficulty: 'hard',
+      replay: '1',
+    })
+    expect(router.currentRoute.value.query.result).toBeUndefined()
+    expect(
+      JSON.parse(globalThis.sessionStorage.getItem(SOLO_PLAY_ENTRY_KEY) ?? ''),
+    ).toMatchObject({ gameId: 'blink', mode: 'ai' })
+    wrapper.unmount()
+  })
+
+  it('does not enter AI replay when ticket issuance fails', async () => {
+    const router = createGameRouter()
+    await router.push('/games/blink/result?mode=ai&result=completed')
+    await router.isReady()
+    const wrapper = mount(GameResultPage, {
+      global: {
+        plugins: [router, createResultPinia('blink', false, false, 'ai')],
+      },
+    })
+    await flushPromises()
+
+    const replayButton = wrapper
+      .findAll('button')
+      .find((button) => button.text().includes('다시'))
+    await replayButton?.trigger('click')
+    await flushPromises()
+
+    expect(router.currentRoute.value.name).toBe('game-result')
+    expect(globalThis.sessionStorage.getItem(SOLO_PLAY_ENTRY_KEY)).toBeNull()
+    wrapper.unmount()
+  })
+
+  it('does not enter SOLO replay when no participant identity is available', async () => {
+    const router = createGameRouter()
+    await router.push('/games/blink/result?mode=solo&result=completed')
+    await router.isReady()
+    const wrapper = mount(GameResultPage, {
+      global: { plugins: [router, createResultPinia('blink')] },
+    })
+    await flushPromises()
+    await nextTick()
+
+    const replayButton = wrapper
+      .findAll('button')
+      .find((button) => button.text() === '다시 플레이')
+    await replayButton?.trigger('click')
+    await flushPromises()
+
+    expect(router.currentRoute.value.name).toBe('game-result')
+    expect(globalThis.sessionStorage.getItem(SOLO_PLAY_ENTRY_KEY)).toBeNull()
+    wrapper.unmount()
+  })
+
+  it('redirects a SOLO play URL without a ticket before starting the game', async () => {
+    const router = createGameRouter()
+    await router.push('/games/blink/play?mode=solo')
+    await router.isReady()
+
+    const wrapper = mount(GamePlayPage, {
+      global: { plugins: [router, createPinia()] },
+    })
+    await flushPromises()
+    await nextTick()
+
+    expect(router.currentRoute.value.name).toBe('game-detail')
+    expect(globalThis.sessionStorage.getItem('edc-game-in-progress')).toBeNull()
+    wrapper.unmount()
+  })
+
+  it('rejects a replay URL without a ticket', async () => {
+    const router = createGameRouter()
+    await router.push('/games/blink/play?mode=solo&replay=1')
+    await router.isReady()
+
+    const wrapper = mount(GamePlayPage, {
+      global: { plugins: [router, createPinia()] },
+    })
+    await flushPromises()
+    await nextTick()
+
+    expect(router.currentRoute.value.name).toBe('game-detail')
+    expect(globalThis.sessionStorage.getItem('edc-game-in-progress')).toBeNull()
+    wrapper.unmount()
+  })
+
+  it.each([
+    ['direct', '/games/blink/play?mode=ai'],
+    ['replay', '/games/blink/play?mode=ai&replay=1'],
+  ])('redirects an AI %s URL without a ticket', async (_kind, path) => {
+    const router = createGameRouter()
+    await router.push(path)
+    await router.isReady()
+
+    const wrapper = mount(GamePlayPage, {
+      global: { plugins: [router, createPinia()] },
+    })
+    await flushPromises()
+    await nextTick()
+
+    expect(router.currentRoute.value.name).toBe('game-detail')
+    expect(globalThis.sessionStorage.getItem('edc-game-in-progress')).toBeNull()
+    wrapper.unmount()
+  })
+
+  it.each([
+    ['solo', 'ai'],
+    ['ai', 'solo'],
+  ] as const)(
+    'rejects a %s ticket when entering %s mode',
+    async (issuedMode, routeMode) => {
+      issueGuestPlayEntry('blink', issuedMode)
+      const router = createGameRouter()
+      await router.push(`/games/blink/play?mode=${routeMode}`)
+      await router.isReady()
+
+      const wrapper = mount(GamePlayPage, {
+        global: { plugins: [router, createPinia()] },
+      })
+      await flushPromises()
+
+      expect(router.currentRoute.value.name).toBe('game-detail')
+      expect(globalThis.sessionStorage.getItem(SOLO_PLAY_ENTRY_KEY)).toBeNull()
+      wrapper.unmount()
+    },
+  )
+
+  it('redirects an AI refresh after its ticket was consumed', async () => {
+    issueGuestPlayEntry('blink', 'ai')
+    const router = createGameRouter()
+    await router.push('/games/blink/play?mode=ai')
+    await router.isReady()
+
+    const wrapper = mount(GamePlayPage, {
+      global: { plugins: [router, createPinia()] },
+    })
+    await flushPromises()
+    expect(router.currentRoute.value.name).toBe('game-play')
+    expect(globalThis.sessionStorage.getItem(SOLO_PLAY_ENTRY_KEY)).toBeNull()
+    wrapper.unmount()
+
+    globalThis.sessionStorage.setItem('edc-game-in-progress', 'blink')
+    const refreshRouter = createGameRouter()
+    await refreshRouter.push('/games/blink/play?mode=ai')
+    await refreshRouter.isReady()
+    const refreshedWrapper = mount(GamePlayPage, {
+      global: { plugins: [refreshRouter, createPinia()] },
+    })
+    await flushPromises()
+
+    expect(refreshRouter.currentRoute.value.name).toBe('game-detail')
+    expect(globalThis.sessionStorage.getItem('edc-game-in-progress')).toBeNull()
+    refreshedWrapper.unmount()
+  })
+
+  it('rejects a ticket issued for another game', async () => {
+    issueGuestSoloEntry('blink')
+    const router = createGameRouter()
+    await router.push('/games/rhythm/play?mode=solo')
+    await router.isReady()
+
+    const wrapper = mount(GamePlayPage, {
+      global: { plugins: [router, createPinia()] },
+    })
+    await flushPromises()
+
+    expect(router.currentRoute.value.name).toBe('game-detail')
+    expect(globalThis.sessionStorage.getItem(SOLO_PLAY_ENTRY_KEY)).toBeNull()
+    wrapper.unmount()
+  })
+
+  it('rejects a ticket after the participant identity changes', async () => {
+    issueGuestSoloEntry('blink')
+    globalThis.sessionStorage.setItem(GUEST_STORAGE_KEY, 'guest-2')
+    const router = createGameRouter()
+    await router.push('/games/blink/play?mode=solo')
+    await router.isReady()
+
+    const wrapper = mount(GamePlayPage, {
+      global: { plugins: [router, createPinia()] },
+    })
+    await flushPromises()
+
+    expect(router.currentRoute.value.name).toBe('game-detail')
+    expect(globalThis.sessionStorage.getItem(SOLO_PLAY_ENTRY_KEY)).toBeNull()
+    wrapper.unmount()
+  })
+
+  it('clears a stale progress marker when the SOLO ticket is missing', async () => {
+    globalThis.sessionStorage.setItem('edc-game-in-progress', 'blink')
+    const router = createGameRouter()
+    await router.push('/games/blink/play?mode=solo')
+    await router.isReady()
+
+    const wrapper = mount(GamePlayPage, {
+      global: { plugins: [router, createPinia()] },
+    })
+    await flushPromises()
+
+    expect(router.currentRoute.value.name).toBe('game-detail')
+    expect(globalThis.sessionStorage.getItem('edc-game-in-progress')).toBeNull()
+    wrapper.unmount()
+  })
+
+  it.each(['air', 'hold', 'draw', 'rhythm', 'blink'])(
+    'disables multiplayer replay after the opponent has left: %s',
+    async (gameId) => {
+      const router = createGameRouter()
+      await router.push(
+        `/games/${gameId}/result?mode=random&result=opponent-left`,
+      )
+      await router.isReady()
+      const pinia =
+        gameId === 'draw'
+          ? createDrawResultPinia(gameId as GameDetailId, 'random')
+          : createCompetitiveResultPinia(
+              gameId as GameDetailId,
+              'WIN',
+              'random',
+            )
+      const wrapper = mount(GameResultPage, {
+        global: { plugins: [router, pinia] },
+      })
+
+      const replayButtons = wrapper
+        .findAll('button')
+        .filter((button) => button.text().includes('다시 플레이'))
+      expect(replayButtons.length).toBeGreaterThan(0)
+      replayButtons.forEach((button) => {
+        expect(button.attributes('disabled')).toBeDefined()
+      })
+      expect(wrapper.text()).toContain(
+        '상대방이 퇴장하여 다시 플레이할 수 없습니다.',
+      )
+
+      await replayButtons[0].trigger('click')
+      await flushPromises()
+      expect(router.currentRoute.value.name).toBe('game-result')
+      wrapper.unmount()
+    },
+  )
+
+  it('disables replay when the result screen receives PARTICIPANT_LEFT', async () => {
+    globalThis.sessionStorage.setItem(GUEST_STORAGE_KEY, 'guest-1')
+    vi.stubGlobal('WebSocket', MockWebSocket)
+    MockWebSocket.instances = []
+
+    const router = createGameRouter()
+    await router.push('/games/rhythm/result?mode=friends&roomId=room-1')
+    await router.isReady()
+    const wrapper = mount(GameResultPage, {
+      global: {
+        plugins: [router, createCompetitiveResultPinia('rhythm', 'WIN')],
+      },
+    })
+    await flushPromises()
+
+    const ws = MockWebSocket.instances[0]
+    expect(ws).toBeTruthy()
+    ws.simulateOpen()
+    ws.simulateMessage({
+      type: 'PARTICIPANT_LEFT',
+      data: { participantKey: 'GUEST:peer' },
+    })
+    await nextTick()
+
+    const replayButton = wrapper
+      .findAll('button')
+      .find((button) => button.text().includes('다시 플레이'))
+    expect(replayButton?.attributes('disabled')).toBeDefined()
+    expect(wrapper.text()).toContain(
+      '상대방이 퇴장하여 다시 플레이할 수 없습니다.',
+    )
+
+    wrapper.unmount()
+    globalThis.sessionStorage.removeItem(GUEST_STORAGE_KEY)
+  })
+
+  it.each([true, false])(
+    'renders the blink solo result asset based on the new-record state: %s',
+    async (isNewRecord) => {
+      const router = createGameRouter()
+      await router.push('/games/blink/result?mode=solo')
+      await router.isReady()
+      const wrapper = mount(GameResultPage, {
+        global: {
+          plugins: [router, createResultPinia('blink', false, isNewRecord)],
+        },
+      })
+
+      const resultHero = wrapper.get('.result-hero')
+      const imageSrc = resultHero.get('img').attributes('src')
+
+      expect(wrapper.find('.record-badge').exists()).toBe(isNewRecord)
+      if (isNewRecord) {
+        expect(resultHero.classes()).not.toContain(
+          'result-hero--blink-record-missed',
+        )
+      } else {
+        expect(resultHero.classes()).toContain(
+          'result-hero--blink-record-missed',
+        )
+      }
+      expect(imageSrc).toContain(
+        isNewRecord ? 'game-blink.png' : 'profile-blink-record-missed',
+      )
+      wrapper.unmount()
+    },
+  )
+
+  it.each(['WIN', 'LOSE', 'DRAW'] as const)(
+    'renders the blink %s competitive result with the shared duel UI',
+    async (outcome) => {
+      const router = createGameRouter()
+      await router.push('/games/blink/result?mode=friends')
+      await router.isReady()
+      const wrapper = mount(GameResultPage, {
+        global: {
+          plugins: [router, createCompetitiveResultPinia('blink', outcome)],
+        },
+      })
+
+      expect(wrapper.find('.air-result').exists()).toBe(true)
+      expect(wrapper.find('.air-duel-scoreboard').exists()).toBe(true)
+      expect(wrapper.find('.blink-result').exists()).toBe(false)
+      expect(wrapper.find('.duel-loss').exists()).toBe(false)
+      expect(wrapper.text()).toContain('3')
+      expect(wrapper.text()).toContain('5')
+      expect(wrapper.text()).not.toContain('3회')
+      expect(wrapper.text()).not.toContain('5회')
+      expect(wrapper.text()).not.toContain('깜빡임 횟수')
+
+      if (outcome === 'WIN') {
+        expect(wrapper.text()).toContain('YOU WIN!')
+      } else if (outcome === 'LOSE') {
+        expect(wrapper.text()).toContain('YOU LOSE...')
+        expect(wrapper.text()).not.toContain('YOU WIN!')
+      } else {
+        expect(wrapper.text()).toContain('DRAW')
+        expect(wrapper.text()).not.toContain('YOU WIN!')
+      }
+
+      wrapper.unmount()
+    },
+  )
+
+  it('does not render an unknown competitive result as a win', async () => {
+    const router = createGameRouter()
+    await router.push('/games/rhythm/result?mode=friends')
+    await router.isReady()
+    const wrapper = mount(GameResultPage, {
+      global: {
+        plugins: [router, createCompetitiveResultPinia('rhythm', 'UNKNOWN')],
+      },
+    })
+
+    expect(wrapper.find('.competitive-pending-result').exists()).toBe(true)
+    expect(wrapper.find('.duel-loss').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('YOU WIN!')
+    wrapper.unmount()
+  })
+
+  it('does not render a fallback result when the result store is empty', async () => {
+    const router = createGameRouter()
+    await router.push('/games/rhythm/result?mode=solo')
+    await router.isReady()
+    const wrapper = mount(GameResultPage, {
+      global: { plugins: [router, createPinia()] },
+    })
+
+    expect(wrapper.find('.result-shell').exists()).toBe(false)
+    expect(wrapper.find('.missing').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain('1,860점')
+    wrapper.unmount()
+  })
+
+  it('shows the draw result summary with real round score tooltips', async () => {
+    const router = createGameRouter()
+    await router.push('/games/draw/result?mode=solo')
+    await router.isReady()
+    const pinia = createResultPinia('draw', true)
+    const wrapper = mount(GameResultPage, {
+      global: { plugins: [router, pinia] },
+    })
+
+    expect(wrapper.text()).toContain('게임이 종료되었습니다!')
+    expect(wrapper.text()).toContain(
+      '3개 라운드의 그림 인식 결과를 확인해보세요.',
+    )
+    expect(wrapper.text()).toContain('최종 총점')
+    expect(wrapper.text()).toContain('680점')
+    expect(wrapper.text()).toContain('NEW RECORD')
+    expect(wrapper.text()).not.toContain('랭킹 반영 예정')
+
+    const roundCards = wrapper.findAll('.draw-round-card')
+    expect(roundCards).toHaveLength(3)
+    expect(wrapper.text()).toContain('정답')
+    expect(wrapper.text()).toContain('쉬움')
+
+    const scoreButton = wrapper.get('.draw-round-card__score')
+    const describedBy = scoreButton.attributes('aria-describedby')
+    expect(describedBy).toBeTruthy()
+    const tooltip = wrapper.find(`#${describedBy}`)
+    expect(tooltip.exists()).toBe(true)
+    expect(tooltip.text()).toContain('상세 점수')
+    expect(tooltip.text()).toContain('시간 보너스')
+
+    expect(wrapper.text()).toContain('랭킹 결과')
+    expect(wrapper.text()).toContain('전체 랭킹 보기')
+    expect(wrapper.text()).toContain('다시 플레이')
+
+    const gamesButton = wrapper
+      .findAll('button')
+      .find((button) => button.text() === '게임 목록')
+    expect(gamesButton?.exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it.each(['air', 'rhythm', 'blink'])(
+    'renders the draw result assets for %s competitive games',
+    async (gameId) => {
+      const router = createGameRouter()
+      await router.push('/games/' + gameId + '/result?mode=random')
+      await router.isReady()
+      const wrapper = mount(GameResultPage, {
+        global: {
+          plugins: [router, createDrawResultPinia(gameId as GameDetailId)],
+        },
+      })
+
+      expect(wrapper.text()).toContain('DRAW')
+      expect(wrapper.text()).toContain('팽팽했어요!')
+      expect(wrapper.text()).not.toContain('YOU WIN!')
+      expect(
+        wrapper.get('img[alt="무승부 결과 배너 캐릭터"]').attributes('src'),
+      ).toContain('profile-draw-result-banner')
+      expect(
+        wrapper.get('img[alt="무승부 내 플레이어"]').attributes('src'),
+      ).toContain('profile-main-character-versus-draw')
+      expect(
+        wrapper.get('img[alt="무승부 상대 플레이어"]').attributes('src'),
+      ).toContain('profile-rival-character-versus-draw')
+
+      wrapper.unmount()
+    },
+  )
+})
